@@ -190,6 +190,39 @@ Set by **Clock** on the channel, not by the file:
   points ÷ sample rate. Use this to preserve the original timing: a capture taken
   at 1 GSa/s replays at its true speed if you set the same rate.
 
+### DDS or TrueArb
+
+Both play the same stored points; they differ in what the DAC clock is doing.
+
+**DDS** runs the DAC at a fixed high rate and steps through the stored record
+with a phase accumulator, so one pass through the record is one output period at
+whatever frequency you ask for. The frequency is an independent setting with very
+fine resolution, and it does not care how long the record is. The cost is that at
+speed the accumulator does not land on every stored point — it skips and repeats
+to hit the frequency, so fine detail between samples is not guaranteed to appear.
+
+**TrueArb** clocks the DAC at exactly the sample rate you set and emits every
+stored point, in order, once per period. Nothing is skipped, so a sequence of
+values comes out exactly as written. The price is that frequency is no longer
+independent: it is `rate / points`.
+
+Measured on this unit with the same 50,000-point waveform:
+
+| | DDS | TrueArb |
+|---|---|---|
+| Frequency | independent, set directly | `rate / points` |
+| Range reached | up to **20 MHz** | 75 MSa/s ÷ 50,000 = **1.5 kHz** |
+| Resolution | ≤ 0.0001 Hz confirmed | sample rate 0.001 Sa/s … 75 MSa/s |
+| Every sample output? | not guaranteed | yes |
+
+That 20 MHz against 1.5 kHz is the whole trade in one line, and it is the same
+record either way.
+
+**Use TrueArb** for a pulse sequence, a captured transient, or a typed list of
+values — anything where the individual samples *are* the waveform, and where you
+want the timing to be exactly what you computed. **Use DDS** for a repetitive
+shape you want at a precise, high, or finely-tuned frequency.
+
 ### Why the frequency moves when you change waveform
 
 In TrueArb the frequency is not an independent setting. The points leave at the
@@ -226,10 +259,52 @@ preview draws it that way - `steps-post`, with a marker per sample when the
 record is short enough to see them. On a smooth 50,000-point record it makes no
 visible difference; on a ten-value list it is the entire shape.
 
-The **Interp** box writes the instrument's `INTER` parameter (`LINE` / `HOLD`),
-but the 4063B never reports it back in a `SRATE?` reply, so the box clears again
-after Apply and there is no way to confirm which mode is in force. Observed
-behaviour is hold.
+The **Interp** box writes the instrument's `INTER` parameter, which chooses how
+the DAC gets from one sample to the next in TrueArb:
+
+- **HOLD** — zero-order hold. Each sample is held for a full clock period and the
+  output is a staircase. Every level you wrote is a real, flat, measurable level,
+  which is what you want when the samples *are* the setpoints.
+- **LINE** — linear interpolation. The output ramps from each sample to the next
+  instead of stepping, so a coarsely-sampled curve comes out smooth. Fewer
+  high-frequency steps to filter, but no flat dwell at each value.
+
+At a high sample rate the difference disappears into the analogue bandwidth; at a
+low one it is the whole character of the output.
+
+**Unverified on this unit.** `SRATE?` never echoes `INTER` back, whichever value
+is written, so the box clears after Apply and the app cannot show which mode is
+in force. Setting `LINE` and `HOLD` produced identical readback. Observed
+behaviour is hold, and the preview assumes it. Settling it takes a scope, a low
+sample rate and a handful of points.
+
+## Waveforms in generator memory
+
+The list at the bottom left shows what the generator holds, and whether this app
+has a local copy of the samples.
+
+**There is no remote delete.** Confirmed by probing rather than assumed: `WVDT
+DEL`, `STL DEL`, `DELETE` and the whole SCPI `MMEM` subsystem all return
+`-113 "Undefined header"`, and `C1:WVDT DEL,<name>` is accepted with no error and
+no effect. Waveforms come off at the front panel, Utility > Store/Recall.
+Re-uploading a name overwrites it, so reusing names keeps the list from growing.
+
+**Forget local copy** deletes only this app's copy of the samples; the waveform
+stays on the generator. **Use on channel** stages the selected waveform on the
+channel named in the upload row — it does not send anything until you Apply.
+
+### Why a local copy is needed at all
+
+The generator will not read a stored waveform back out over USB: `WVDT?` times
+out and wedges the session. So a waveform uploaded in an earlier session is a
+name and nothing else, and cannot be drawn.
+
+Every upload therefore saves a copy to `%APPDATA%\BK4063B-AWG-GUI\uploaded\` as
+`.npy`, and those are loaded at startup — which is what lets the preview draw a
+waveform you uploaded days ago. What is stored is the normalised samples, i.e.
+what the DAC actually received, not the raw file. Waveforms already on the
+generator before this app existed show as `no local copy`; upload them again from
+source to get one.
 
 **Deleting** an uploaded waveform has to be done at the front panel
 (Utility -> Store/Recall) - the firmware exposes no SCPI for it.

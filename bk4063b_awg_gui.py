@@ -49,6 +49,12 @@ USB_ID = "0xF4EC::0xEE38"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
                            "BK4063B-AWG-GUI", "config.json")
 
+# A copy of every waveform this app uploads, kept because the generator cannot
+# read a stored waveform back out: without this, a waveform uploaded in an
+# earlier session can never be drawn again. Beside the config, out of the
+# program folder so a git pull cannot clobber it.
+WAVE_CACHE = os.path.join(os.path.dirname(CONFIG_PATH), "uploaded")
+
 CHANNELS = (1, 2)
 WAVE_TYPES = ("SINE", "SQUARE", "RAMP", "PULSE", "NOISE", "DC", "ARB")
 LOADS = ("50", "75", "100", "600", "10000", "HZ")
@@ -486,6 +492,42 @@ def default_column(names, ncols):
     return 0 if ncols == 1 else 1
 
 
+def cache_file(name):
+    return os.path.join(WAVE_CACHE, safe_name(name) + ".npy")
+
+
+def cache_save(name, samples):
+    """Keep a copy of what was just uploaded, so it can be previewed later."""
+    os.makedirs(WAVE_CACHE, exist_ok=True)
+    np.save(cache_file(name), np.asarray(samples, dtype=np.float32))
+
+
+def cache_load():
+    """Every waveform this app has uploaded, as {name: samples}."""
+    out = {}
+    try:
+        entries = sorted(os.listdir(WAVE_CACHE))
+    except OSError:
+        return out
+    for entry in entries:
+        if not entry.endswith(".npy"):
+            continue
+        try:
+            out[entry[:-4]] = np.asarray(np.load(os.path.join(WAVE_CACHE, entry)),
+                                         dtype=np.float64).ravel()
+        except Exception:
+            pass                      # a corrupt cache entry is not worth a crash
+    return out
+
+
+def cache_forget(name):
+    try:
+        os.remove(cache_file(name))
+        return True
+    except OSError:
+        return False
+
+
 def safe_name(text):
     """Trim a typed prefix down to something legal in a filename."""
     out = "".join("_" if c in BAD_NAME_CHARS else c for c in text.strip())
@@ -815,7 +857,8 @@ class App:
         self.busy = False
         self.arb_samples = None       # samples loaded from disk, not yet uploaded
         self.arb_table = None         # every column of that file, for the picker
-        self.known_waves = {}         # name -> samples, for anything we uploaded
+        self.known_waves = cache_load()   # name -> samples, from earlier sessions
+        self.device_waves = []        # what the generator last said it holds
         self.arb_source = ""
         self.read_stamp = ""
 
@@ -865,6 +908,7 @@ class App:
         self.sync.pack(side="left", padx=6)
 
         self.build_setups(left, pad)
+        self.build_memory(left, pad)
         # The waveform tools sit under the preview rather than in the left
         # column: they are what the preview is showing, and the channel panels
         # already fill the height on a laptop screen.
@@ -1149,6 +1193,94 @@ class App:
                                      state="disabled")
         self.upload_btn.pack(side="left", padx=4)
 
+    def build_memory(self, parent, pad):
+        f = ttk.LabelFrame(parent, text="Waveforms in generator memory")
+        f.pack(fill="both", expand=True, **pad)
+
+        # Controls first, from the bottom up: the list is the part that should
+        # give up space when the column runs short, not the buttons.
+        ttk.Label(f, foreground="#666", justify="left", text=(
+            "No remote delete on this firmware - waveforms come off at the front\n"
+            "panel (Utility > Store/Recall). Re-uploading a name overwrites it.")
+        ).pack(side="bottom", anchor="w", padx=6, pady=(0, 6))
+
+        row = ttk.Frame(f)
+        row.pack(side="bottom", fill="x", padx=6, pady=2)
+        self.mem_btn = ttk.Button(row, text="Refresh", command=self.do_read,
+                                  state="disabled")
+        self.mem_btn.pack(side="left")
+        ttk.Button(row, text="Forget local copy",
+                   command=self.do_forget).pack(side="left", padx=6)
+        ttk.Button(row, text="Use on channel",
+                   command=self.do_use_wave).pack(side="left")
+
+        box = ttk.Frame(f)
+        box.pack(fill="both", expand=True, padx=6, pady=(6, 0))
+        self.mem_list = tk.Listbox(box, height=4, font=("Consolas", 9),
+                                   exportselection=False)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.mem_list.yview)
+        self.mem_list.configure(yscrollcommand=sb.set)
+        self.mem_list.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+    def refresh_memory(self, names):
+        """Show what is on the generator and what we hold a local copy of."""
+        self.device_waves = list(names or [])
+        self.mem_list.delete(0, "end")
+        for name in self.device_waves:
+            samples = self.known_waves.get(name)
+            note = (f"{samples.size:>9,} pts" if samples is not None
+                    else "  no local copy")
+            self.mem_list.insert("end", f"{name:<18}{note}")
+        # A cached waveform the generator no longer lists was deleted at the
+        # front panel, or uploaded from another machine. Say so rather than
+        # leaving a name that looks live.
+        for name in sorted(set(self.known_waves) - set(self.device_waves)):
+            self.mem_list.insert("end", f"{name:<18}  local copy only")
+
+    def selected_wave(self):
+        picked = self.mem_list.curselection()
+        if not picked:
+            return None
+        return self.mem_list.get(picked[0]).split()[0]
+
+    def do_forget(self):
+        """Drop this app's local copy. The generator keeps its own."""
+        name = self.selected_wave()
+        if not name:
+            self.log("Pick a waveform in the list first.")
+            return
+        if name not in self.known_waves:
+            self.log(f"No local copy of '{name}' to forget.")
+            return
+        if not messagebox.askokcancel(
+                "Forget local copy?",
+                f"Delete this app's local copy of '{name}'?\n\n"
+                "The waveform stays in the generator's memory - this only means "
+                "the preview can no longer draw it. There is no way to delete it "
+                "from the generator over USB; that is done at the front panel."):
+            return
+        self.known_waves.pop(name, None)
+        cache_forget(name)
+        self.log(f"Forgot the local copy of '{name}' (still on the generator)")
+        self.refresh_memory(self.device_waves)
+        self.draw_preview()
+
+    def do_use_wave(self):
+        """Put the selected waveform into the channel chosen in the upload row."""
+        name = self.selected_wave()
+        if not name:
+            self.log("Pick a waveform in the list first.")
+            return
+        if name not in self.device_waves:
+            self.log(f"'{name}' is not in the generator's memory - upload it first.")
+            return
+        ch = int(self.arb_ch.get())
+        self.vars[f"C{ch}:BSWV:WVTP"].set("ARB")
+        self.vars[f"C{ch}:ARWV:NAME"].set(name)
+        self.preview_ch.set(f"CH{ch}")
+        self.log(f"CH{ch} set to '{name}' - press Apply changes to send it")
+
     def build_setups(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Setups")
         f.pack(fill="x", **pad)
@@ -1296,7 +1428,7 @@ class App:
         live = bool(self.awg.inst) and not busy
         state = "normal" if live else "disabled"
         for btn in (self.read_btn, self.apply_btn, self.save_btn,
-                    self.recall_btn):
+                    self.recall_btn, self.mem_btn):
             btn.configure(state=state)
         for ch in CHANNELS:
             getattr(self, f"on_btn{ch}").configure(state=state)
@@ -1467,6 +1599,7 @@ class App:
             for ch in CHANNELS:
                 getattr(self, f"arbcombo{ch}").configure(values=names)
             self.log(f"User waveforms: {', '.join(names) if names else '(none)'}")
+            self.refresh_memory(names)
         self.read_stamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.set_busy(False)
         self.refresh_marks()
@@ -1670,6 +1803,7 @@ class App:
                 if norm:
                     kept = kept / (float(np.max(np.abs(kept))) or 1.0)
                 self.known_waves[name] = np.clip(kept, -1.0, 1.0)
+                cache_save(name, self.known_waves[name])
                 blocks = {c: self.awg.read_channel(c) for c in CHANNELS}
                 names = self.awg.user_waveforms()
                 self.root.after(0, lambda: self.after_read(blocks, names,
