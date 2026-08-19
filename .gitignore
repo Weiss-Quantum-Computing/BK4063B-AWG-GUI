@@ -1,0 +1,12 @@
+# Saved instrument setups - these belong in the lab notebook, not in git
+awg_setups/
+*.json
+*.txt
+*.csv
+*.npy
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

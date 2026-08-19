@@ -1,0 +1,144 @@
+# BK4063B AWG GUI
+
+Panel control for a B&K Precision 4063B arbitrary waveform generator. The mirror
+image of [Scope Grab](../scope-grab): instead of pulling a capture off an
+instrument, this pushes a setup onto one. Same shape - single file, PyVISA over
+the rear-panel USB-B port, no vendor software.
+
+Edit the panel, press **Apply changes**, and the generator follows. Press
+**Save setup** and the whole instrument state lands in a timestamped JSON you can
+recall later or file alongside the data it produced.
+
+| File | Contents |
+|------|----------|
+| `<prefix>_<timestamp>.json` | Full instrument state - every SCPI block for both channels, verbatim. This is what Recall reads. |
+| `<prefix>_<timestamp>.txt` | The same thing laid out for reading: output state, load, wave, modulation |
+
+## Requirements
+
+- NI-VISA, or any VISA runtime (Keysight IO Libraries works too - the 4063B shows
+  up either way)
+- Python 3.9+
+- `pip install pyvisa numpy matplotlib`
+
+Matplotlib is optional; without it you lose the waveform preview and nothing else.
+
+## Usage
+
+```
+pythonw bk4063b_awg_gui.py
+```
+
+`pythonw` keeps the console window from appearing. The app auto-connects to the
+first 4063B it finds on USB; hit **Connect** to retry.
+
+## Outputs are never switched for you
+
+This is the one place where a generator panel differs from a capture tool: a wrong
+click here puts a voltage into something.
+
+- **Apply changes**, **Recall setup** and closing the window never touch an output
+  switch. Only the **ON** / **OFF** buttons do.
+- **confirm before switching an output on** (on by default) puts a confirmation in
+  front of anything that changes what a live channel is emitting: switching an
+  output on, applying to a channel that is already on, or uploading an arb to one.
+  The dialog quotes the generator's own last-read setting, not whatever unapplied
+  edit is sitting in the panel.
+- The lamp beside each channel reads **ON** in red or **OFF** in green, taken from
+  the generator on every read - not from what the panel last asked for.
+
+Closing the app leaves a running channel running. That is deliberate: shutting a
+control panel should not interrupt something the bench is in the middle of.
+
+## The panel
+
+Each channel gets output state, load and polarity; a wave type with its
+parameters; arb selection and sample clock; and one modulation/sweep/burst row.
+
+- **Greyed cells** are the parameters the selected wave type has no use for. They
+  are ignored by Apply even if they still hold a number from a previous type.
+- **`*` markers** flag a cell you have edited but not applied yet, and the status
+  line beside the buttons counts them. It reads `in sync (hh:mm:ss)` when the
+  panel matches the generator.
+- **Apply sends only what you edited.** Untouched settings are not rewritten,
+  which matters on a channel that is currently driving something.
+- **Mode** is one row because the instrument allows only one of modulation, sweep
+  and burst at a time. Picking a mode relabels the parameter slots beneath it.
+- **Preview** draws what Apply *would* produce, computed locally from the panel -
+  not read back from the generator. An arb already loaded on the instrument
+  cannot be previewed (its samples are not readable over USB); load the file in
+  the upload box and the preview picks it up.
+
+## Uploading an arbitrary waveform
+
+**Load file...** takes `.csv`, `.txt`, `.dat` or `.npy`. A two-column file is read
+as time,volts and the last column is used as the samples. Pick a name and a
+channel, then **Upload** - the waveform goes into the generator's user memory and
+is selected on that channel.
+
+`normalise to full scale` scales the largest sample to the DAC's full scale. Turn
+it off if your samples are already in -1.0..+1.0 and you want the headroom kept
+exactly; anything outside that range is clipped.
+
+Samples go out as signed 16-bit little-endian, matching the 4063B's 16-bit DAC.
+An odd point count is rejected by the instrument, so the last sample is dropped.
+
+**Deleting** an uploaded waveform has to be done at the front panel
+(Utility -> Store/Recall) - the firmware exposes no SCPI for it.
+
+## Command ordering
+
+The 4063B accepts these without error and then silently ignores or overrides
+them. `Awg.apply_channel` sequences around all four; they are worth knowing if you
+drive the instrument from your own scripts.
+
+- **The declared load rescales amplitude.** Set the load *after* the amplitude and
+  a 1.5 Vpp request typed against HiZ quietly becomes 0.75 Vpp when the load
+  changes to 50 ohm. Load goes first.
+- **`ARWV` and `SRATE` both force `WVTP,ARB`.** Selecting an arb or touching the
+  sample-clock mode rewrites the wave type, so both must precede `BSWV`.
+- **`BSWV` clears active modulation**, so the carrier must be set before the mode
+  block, never after.
+- **`MDWV STATE,ON` and the type tag must be separate commands.** Combined, as in
+  `MDWV STATE,ON,FM,...`, the instrument applies the state and drops the type
+  switch, leaving you on the previous modulation.
+
+The carrier also constrains what is legal: PWM needs a PULSE carrier, and the rest
+need SINE/SQUARE/RAMP/ARB. Ask for AM on a pulse carrier and you quietly get PWM.
+
+## Reading replies
+
+Query responses need more than a comma split. `MDWV`/`SWWV`/`BTWV` carry a bare
+modulation-type tag mid-string, which shifts every later key/value pair by one,
+and a trailing `CARR,...` carrier block whose keys collide with the modulation's
+own - flattened, `FRQ` reports the carrier frequency instead of the modulating
+one. `parse_reply` handles both; the carrier comes back as a nested dict.
+
+## Setups
+
+**Save setup** writes both channels' full state. **Recall setup** applies one back,
+in the order above, leaving the output switches alone. Recall is byte-exact: every
+block reads back identical to what was saved, across sine, ramp, modulation, sweep,
+burst and TrueArb.
+
+Config - folder, prefix, arb name and the safety toggle - lives in
+`%APPDATA%\BK4063B-AWG-GUI\config.json`, out of the program folder so a `git pull` cannot
+clobber it.
+
+## Scripting
+
+[`bk4063b.py`](bk4063b.py) is a standalone scripting library for the same
+instrument. The GUI does not import it - `bk4063b_awg_gui.py` carries its own
+copy of the instrument layer so it stays a single droppable file - but the
+library adds per-waveform convenience methods the GUI's internal `Awg` class
+does not have, plus a scoped `snapshot`/`restore` pair.
+
+```python
+from bk4063b import BK4063B
+
+with BK4063B() as awg:
+    snap = awg.snapshot(channels=(2,))   # scope it so CH1 is never rewritten
+    awg.sine(2, freq=1e3, amp=2.0)
+    awg.output(2, True, load=50)
+    awg.restore(snap)
+```
