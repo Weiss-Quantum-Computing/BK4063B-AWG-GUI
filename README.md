@@ -58,7 +58,7 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
 - **Greyed cells** are the parameters the current settings give no meaning to,
   and Apply ignores them even if they still hold a number from a previous type.
   This works at two levels: the arb row only applies to `ARB`, and within it
-  **Sa/s** and **Interp** only apply to the **TrueArb** clock, since DDS derives
+  **Sa/s** only applies to the **TrueArb** clock, since DDS derives
   its timing from the frequency instead. A greyed cell still shows what the
   generator reports - it just cannot be edited or sent.
 - **`*` markers** flag a cell you have edited but not applied yet, and the status
@@ -274,26 +274,12 @@ The preview follows the channel's **Clock** setting and says which it is drawing
 picture. On a smooth 50,000-point record the difference is invisible; on a
 ten-value list it is the entire shape.
 
-The **Interp** box writes the instrument's `INTER` parameter, which chooses how
-the DAC gets from one sample to the next in TrueArb:
-
-- **HOLD** — zero-order hold. Each sample is held for a full clock period and the
-  output is a staircase. Every level you wrote is a real, flat, measurable level,
-  which is what you want when the samples *are* the setpoints.
-- **LINE** — linear interpolation. The output ramps from each sample to the next
-  instead of stepping, so a coarsely-sampled curve comes out smooth. Fewer
-  high-frequency steps to filter, but no flat dwell at each value.
-
-At a high sample rate the difference disappears into the analogue bandwidth; at a
-low one it is the whole character of the output.
-
-**Unverified on this unit, and probably not the setting you want anyway.**
-`SRATE?` never echoes `INTER` back whichever value is written, so the box clears
-after Apply and the app cannot show which mode is in force; `LINE` and `HOLD`
-produced identical readback. Note that the hold-versus-ramp behaviour you can
-actually see on a scope tracks the **Clock** setting, not this box - TrueArb
-holds, DDS ramps - so reach for Clock first. Whether `INTER` does anything on top
-of that is untested.
+There was an **Interp** box here that wrote the instrument's `INTER` parameter
+(`LINE` / `HOLD`). It has been removed: `SRATE?` never echoes `INTER` back
+whichever value is written, so it could not show which mode was in force, and
+the hold-versus-ramp behaviour you can actually see on a scope belongs to
+**Clock** anyway. A control that cannot confirm itself and duplicates a working
+one is worse than no control. Set the clock instead.
 
 ## Waveforms in generator memory
 

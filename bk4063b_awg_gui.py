@@ -594,12 +594,13 @@ def parse_reply(response):
     return out
 
 
-def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000):
+def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000, hold=True):
     """One or two cycles of what the panel currently describes, in volts.
 
     Computed here rather than read back from the generator: the point is to show
-    what Apply would produce, before it is applied. Returns (t, v) or None when
-    there is nothing meaningful to draw.
+    what Apply would produce, before it is applied. `hold` picks how an arb gets
+    from one stored point to the next - held under TrueArb, ramped under DDS.
+    Returns (t, v) or None when there is nothing meaningful to draw.
     """
     def num(key, default=0.0):
         try:
@@ -635,8 +636,17 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000):
     elif wvtp == "ARB":
         if arb is None or len(arb) < 2:
             return None                          # shape lives on the instrument
-        idx = (x * len(arb)).astype(int) % len(arb)
-        y = arb[idx]
+        pos = x * len(arb)
+        if hold:
+            # TrueArb: each stored point is held to the next clock, so floor the
+            # index and the staircase is in the samples themselves.
+            y = arb[pos.astype(int) % len(arb)]
+        else:
+            # DDS: the generator ramps from point to point. Interpolating has to
+            # happen here rather than by drawing style, because a floored index
+            # would bake the steps into the data and no line style could undo it.
+            wrapped = np.append(arb, arb[0])     # the record joins back on itself
+            y = np.interp(pos % len(arb), np.arange(len(wrapped)), wrapped)
     else:
         return None
     return t, ofst + (amp / 2.0) * y
@@ -1015,8 +1025,7 @@ class App:
         for col, (text, key, choices, width) in enumerate((
                 ("Arb wave:", f"C{ch}:ARWV:NAME", (), 16),
                 ("Clock:", f"C{ch}:SRATE:MODE", ("DDS", "TARB"), 8),
-                ("Sa/s:", f"C{ch}:SRATE:VALUE", None, 11),
-                ("Interp:", f"C{ch}:SRATE:INTER", ("LINE", "HOLD"), 8))):
+                ("Sa/s:", f"C{ch}:SRATE:VALUE", None, 11))):
             label = ttk.Label(a, text=text)
             label.grid(row=0, column=col * 2, sticky="e",
                        padx=((0, 4) if col == 0 else (8, 4)))
@@ -1418,7 +1427,7 @@ class App:
         arb = wvtp == "ARB"
         tarb = arb and self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB"
         for key, on in ((f"C{ch}:ARWV:NAME", arb), (f"C{ch}:SRATE:MODE", arb),
-                        (f"C{ch}:SRATE:VALUE", tarb), (f"C{ch}:SRATE:INTER", tarb)):
+                        (f"C{ch}:SRATE:VALUE", tarb)):
             self.enable(key, on)
             label = self.arb_labels.get(key)
             if label is not None:
@@ -1498,7 +1507,6 @@ class App:
         out[f"C{ch}:SRATE:MODE"] = str(srate.get("MODE", "") or "")
         val = srate.get("VALUE", "")
         out[f"C{ch}:SRATE:VALUE"] = fmt_value(val) if val != "" else ""
-        out[f"C{ch}:SRATE:INTER"] = str(srate.get("INTER", "") or "")
 
         # Whichever of the three mode blocks is on decides what the row shows.
         mode, params = "Off", {}
@@ -1574,7 +1582,7 @@ class App:
         for key, _, _ in WAVE_PARAMS:
             add("BSWV", key, f"C{ch}:BSWV:{key}")
         add("ARWV", "NAME", f"C{ch}:ARWV:NAME")
-        for key in ("MODE", "VALUE", "INTER"):
+        for key in ("MODE", "VALUE"):
             add("SRATE", key, f"C{ch}:SRATE:{key}")
 
         # The wave type always rides along with any BSWV write: sending
@@ -2034,7 +2042,8 @@ class App:
         # and showing the wrong samples is worse than showing none.
         name = self.vars[f"C{ch}:ARWV:NAME"].get().strip()
         arb = self.known_waves.get(name) if wvtp == "ARB" else None
-        curve = preview_curve(wvtp, vals, arb=arb)
+        style, how = self.arb_style(ch) if arb is not None else ("default", "")
+        curve = preview_curve(wvtp, vals, arb=arb, hold=style == "steps-post")
 
         self.ax.clear()
         if curve is None:
@@ -2047,10 +2056,10 @@ class App:
             self.ax.set_yticks([])
         else:
             t, v = curve
-            # A built-in wave is continuous; an arb is held or interpolated
-            # depending on the clock.
-            style, how = self.arb_style(ch) if arb is not None else ("default", "")
-            self.ax.plot(t * 1e3, v, lw=1.0, drawstyle=style)
+            # Straight lines throughout: for an arb the staircase (or the
+            # ramp) is already in the resampled points, so a step drawstyle here
+            # would step an second time.
+            self.ax.plot(t * 1e3, v, lw=1.0)
             self.ax.set_xlabel("time (ms)")
             self.ax.set_ylabel("volts")
             self.ax.grid(alpha=0.3)
