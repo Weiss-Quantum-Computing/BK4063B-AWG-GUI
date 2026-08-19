@@ -69,6 +69,49 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
   cannot be previewed (its samples are not readable over USB); load the file in
   the upload box and the preview picks it up.
 
+## Building a waveform in the panel
+
+**Build waveform** makes the samples for you: pick a **Shape**, set **Points**,
+press **Build**. The result becomes the pending waveform, the preview switches to
+**pending** to show it, and **Upload** sends it. No file needed.
+
+| Shape | Parameters | What it is for |
+|-------|-----------|----------------|
+| Gaussian | truncation in σ | The default pulse. σ=3 puts the ends at 1%, so there is no step to ring. |
+| Blackman | – | Lowest spectral sidelobes of the windows here; the usual choice for Raman and Rabi pulses where off-resonant excitation matters. |
+| Hann | – | Gentler than Blackman, wider main lobe. |
+| Tukey flat-top | flat fraction | Flat top with cosine shoulders. `flat=0` is a Hann, `flat=1` a square. |
+| Sech (ARP) | truncation | The adiabatic-rapid-passage amplitude profile, and the analytically solvable Rosen–Zener case. Pair with **Chirp**. |
+| Sinc | zero crossings | A rectangle in frequency — the start of a flat-topped spectral profile. |
+| Square pulse | width fraction | Hard-edged gate. |
+| Trapezoid | rise, fall | Linear edges with a settable hold. |
+| Tanh flat-top | edge, flat | Smooth switch-on with no corner: the AOM/EOM intensity ramp. |
+| Linear ramp | start, end | Plain sweep — the EOM ramp. |
+| Exponential ramp | start, end, τ | Evaporative-cooling ramp. `1 → 0` with small τ gives the hard early knee. |
+| Smoothstep ramp | start, end | Minimum-jerk: zero slope *and* zero curvature at both ends, which is what keeps transport or a trap handover adiabatic. |
+| Chirp | start/end cycles, envelope | Linear frequency sweep. Sech envelope + chirp is the standard ARP recipe. |
+| Multitone | comma list of cycles, envelope | Sum of sines for multi-frequency addressing. Cycle counts are per record, so every tone closes cleanly on the repeat. |
+| Gaussian deriv | truncation, β | The quadrature half of a DRAG pulse — Gaussian on one channel, this × β on the other. |
+
+**Carrier cycles** turns any envelope into a burst: the shape becomes the outline
+and a sine at that many cycles per record fills it. Leave it `0` for a bare
+envelope. This is how the Blackman example above is specified — Blackman shape,
+1000 carrier cycles.
+
+Envelopes come out unipolar (0…1) because that is what an intensity control
+wants; anything oscillating comes out bipolar (−1…+1). A unipolar shape therefore
+uses the upper half of the DAC, so it swings from `Offset` to `Offset + Ampl/2` —
+for a 0→5 V ramp set `Ampl = 10 V`, `Offset = 0`.
+
+### Typing or pasting values
+
+**Type/paste values...** takes numbers straight from the clipboard or the
+keyboard — one per line, a single row, or columns separated by commas,
+semicolons or whitespace. A non-numeric first line is read as column names,
+blank lines and `#` comments are skipped, and multi-column input gets the same
+column picker as a file. Ragged rows are rejected rather than silently
+misaligned.
+
 ## Uploading an arbitrary waveform
 
 **Load file...**, pick the column if you are asked, set a name and a channel, then

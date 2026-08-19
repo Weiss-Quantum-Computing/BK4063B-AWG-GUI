@@ -22,6 +22,7 @@ import datetime
 import json
 import os
 import queue
+import re
 import struct
 import threading
 import tkinter as tk
@@ -128,6 +129,313 @@ _BARE_TAGS = {"AM", "DSBAM", "FM", "PM", "PWM", "ASK", "FSK", "PSK"}
 # back in, or derives them from something else we are already sending.
 READ_ONLY_KEYS = {"PERI", "MAX_OUTPUT_AMP", "HLEV", "LLEV", "AMPVRMS",
                   "AMPDBM", "TRMD"}
+
+
+# ---------------------------------------------------------------------------
+# Waveform library
+#
+# Every shape is a pure function of a point count and a parameter lookup, so it
+# can be built, previewed and tested without an instrument attached. Envelopes
+# come out unipolar (0..1) because that is what an intensity control wants; the
+# oscillating shapes come out bipolar (-1..+1). Either way the numbers are a
+# shape, and the volts come from Ampl/Offset on the channel.
+# ---------------------------------------------------------------------------
+
+ENV_CHOICES = ("None", "Blackman", "Gaussian", "Hann", "Tukey")
+
+
+class _Params:
+    """Panel strings read as numbers, with a fallback when a box is empty."""
+
+    def __init__(self, values):
+        self.values = values
+
+    def num(self, key, default):
+        try:
+            text = str(self.values.get(key, "")).strip()
+            return float(text) if text else default
+        except ValueError:
+            return default
+
+    def txt(self, key, default=""):
+        return str(self.values.get(key, "")).strip() or default
+
+    def tones(self, key, default=(10.0,)):
+        out = []
+        for token in str(self.values.get(key, "")).replace(";", ",").split(","):
+            token = token.strip()
+            if token:
+                try:
+                    out.append(float(token))
+                except ValueError:
+                    pass
+        return out or list(default)
+
+
+def _unit(n):
+    """0 .. 1 across the record."""
+    return np.linspace(0.0, 1.0, n)
+
+
+def _centred(n):
+    """-1 .. +1 across the record."""
+    return np.linspace(-1.0, 1.0, n)
+
+
+def _gaussian(n, trunc):
+    """Truncated Gaussian. trunc is the half-width of the record in sigma, so 3
+    puts the ends at exp(-4.5) ~ 1% rather than cutting a visible step."""
+    return np.exp(-0.5 * (_centred(n) * max(trunc, 1e-6)) ** 2)
+
+
+def _tukey(n, flat):
+    """Flat top with raised-cosine shoulders. flat=0 is a Hann, flat=1 a square."""
+    flat = min(max(flat, 0.0), 1.0)
+    x = _unit(n)
+    taper = (1.0 - flat) / 2.0
+    w = np.ones(n)
+    if taper > 0:
+        left, right = x < taper, x > 1.0 - taper
+        w[left] = 0.5 * (1 - np.cos(np.pi * x[left] / taper))
+        w[right] = 0.5 * (1 - np.cos(np.pi * (1.0 - x[right]) / taper))
+    return w
+
+
+def _trapezoid(n, rise, fall):
+    x = _unit(n)
+    rise, fall = max(rise, 0.0), max(fall, 0.0)
+    if rise + fall > 1.0:                       # keep a sane shape if over-specified
+        rise, fall = rise / (rise + fall), fall / (rise + fall)
+    w = np.ones(n)
+    if rise > 0:
+        m = x < rise
+        w[m] = x[m] / rise
+    if fall > 0:
+        m = x > 1.0 - fall
+        w[m] = (1.0 - x[m]) / fall
+    return w
+
+
+def _tanh_top(n, edge, flat):
+    """Flat top with tanh shoulders - a smooth switch-on with no corner, which is
+    what an AOM or EOM intensity ramp usually wants."""
+    x = _centred(n)
+    a = min(max(flat, 0.0), 1.0)
+    w = max(edge, 1e-4)
+    y = 0.5 * (np.tanh((x + a) / w) - np.tanh((x - a) / w))
+    peak = float(y.max())
+    return y / peak if peak > 0 else y
+
+
+def _envelope(name, n, trunc=3.0, flat=0.5):
+    if name == "Blackman":
+        return np.blackman(n)
+    if name == "Gaussian":
+        return _gaussian(n, trunc)
+    if name == "Hann":
+        return np.hanning(n)
+    if name == "Tukey":
+        return _tukey(n, flat)
+    return np.ones(n)
+
+
+def _normalise(y):
+    peak = float(np.max(np.abs(y)))
+    return y / peak if peak > 0 else y
+
+
+def _build_gaussian(n, p):
+    return _gaussian(n, p.num("trunc", 3.0))
+
+
+def _build_blackman(n, p):
+    return np.blackman(n)
+
+
+def _build_hann(n, p):
+    return np.hanning(n)
+
+
+def _build_tukey(n, p):
+    return _tukey(n, p.num("flat", 0.5))
+
+
+def _build_sech(n, p):
+    """Hyperbolic secant - the amplitude profile for adiabatic rapid passage,
+    and analytically solvable as the Rosen-Zener model."""
+    return 1.0 / np.cosh(_centred(n) * max(p.num("trunc", 4.0), 1e-6))
+
+
+def _build_sinc(n, p):
+    """Bipolar. A sinc in time is a rectangle in frequency, so this is the
+    starting point for a flat-topped spectral profile."""
+    return np.sinc(_centred(n) * max(p.num("lobes", 4.0), 1e-6))
+
+
+def _build_square(n, p):
+    width = min(max(p.num("width", 0.5), 0.0), 1.0)
+    return (np.abs(_centred(n)) <= width).astype(float)
+
+
+def _build_trapezoid(n, p):
+    return _trapezoid(n, p.num("rise", 0.1), p.num("fall", 0.1))
+
+
+def _build_tanh_top(n, p):
+    return _tanh_top(n, p.num("edge", 0.1), p.num("flat", 0.6))
+
+
+def _build_linear(n, p):
+    start, end = p.num("start", 0.0), p.num("end", 1.0)
+    return start + (end - start) * _unit(n)
+
+
+def _build_exp(n, p):
+    """Exponential approach from start to end. The usual evaporative-cooling
+    ramp is start 1, end 0, with tau setting how hard the knee is."""
+    start, end = p.num("start", 1.0), p.num("end", 0.0)
+    tau = max(p.num("tau", 0.3), 1e-4)
+    t = _unit(n)
+    k = (1.0 - np.exp(-t / tau)) / (1.0 - np.exp(-1.0 / tau))
+    return start + (end - start) * k
+
+
+def _build_smoothstep(n, p):
+    """Minimum-jerk ramp: zero slope and zero curvature at both ends, which is
+    what keeps a transport or a trap handover adiabatic."""
+    start, end = p.num("start", 0.0), p.num("end", 1.0)
+    t = _unit(n)
+    return start + (end - start) * (t ** 3) * (10 - 15 * t + 6 * t * t)
+
+
+def _build_chirp(n, p):
+    """Linear frequency sweep across the record, in cycles. Pair a chirp with a
+    sech envelope for adiabatic rapid passage."""
+    c0, c1 = p.num("c0", 10.0), p.num("c1", 100.0)
+    t = _unit(n)
+    y = np.sin(2 * np.pi * (c0 * t + 0.5 * (c1 - c0) * t * t))
+    return y * _envelope(p.txt("env", "None"), n)
+
+
+def _build_multitone(n, p):
+    """Sum of sines, each given as a whole number of cycles across the record so
+    every tone closes cleanly when the waveform repeats."""
+    t = _unit(n)
+    y = np.zeros(n)
+    for cycles in p.tones("tones"):
+        y += np.sin(2 * np.pi * cycles * t)
+    return _normalise(y) * _envelope(p.txt("env", "None"), n)
+
+
+def _build_dgauss(n, p):
+    """Derivative of a Gaussian: the quadrature half of a DRAG pulse. Put a
+    Gaussian on one channel and this, scaled by beta, on the other."""
+    x = _centred(n)
+    trunc = max(p.num("trunc", 3.0), 1e-6)
+    y = -x * trunc ** 2 * np.exp(-0.5 * (x * trunc) ** 2)
+    return _normalise(y) * p.num("beta", 1.0)
+
+
+# name -> (builder, [(label, key, default, choices or None)], takes a carrier)
+_CARRIER = [("Carrier cycles", "cycles", "0", None),
+            ("Carrier phase (deg)", "cphase", "0", None)]
+
+BUILD_SHAPES = {
+    "Gaussian":        (_build_gaussian,
+                        [("Truncate (+/-sigma)", "trunc", "3", None)] + _CARRIER),
+    "Blackman":        (_build_blackman, list(_CARRIER)),
+    "Hann":            (_build_hann, list(_CARRIER)),
+    "Tukey flat-top":  (_build_tukey,
+                        [("Flat fraction", "flat", "0.5", None)] + _CARRIER),
+    "Sech (ARP)":      (_build_sech,
+                        [("Truncate (+/-units)", "trunc", "4", None)] + _CARRIER),
+    "Sinc":            (_build_sinc,
+                        [("Zero crossings", "lobes", "4", None)] + _CARRIER),
+    "Square pulse":    (_build_square,
+                        [("Width fraction", "width", "0.5", None)] + _CARRIER),
+    "Trapezoid":       (_build_trapezoid,
+                        [("Rise fraction", "rise", "0.1", None),
+                         ("Fall fraction", "fall", "0.1", None)] + _CARRIER),
+    "Tanh flat-top":   (_build_tanh_top,
+                        [("Edge fraction", "edge", "0.1", None),
+                         ("Flat fraction", "flat", "0.6", None)] + _CARRIER),
+    "Linear ramp":     (_build_linear,
+                        [("Start", "start", "0", None),
+                         ("End", "end", "1", None)] + _CARRIER),
+    "Exponential ramp": (_build_exp,
+                         [("Start", "start", "1", None), ("End", "end", "0", None),
+                          ("Time constant", "tau", "0.3", None)] + _CARRIER),
+    "Smoothstep ramp": (_build_smoothstep,
+                        [("Start", "start", "0", None),
+                         ("End", "end", "1", None)] + _CARRIER),
+    "Chirp":           (_build_chirp,
+                        [("Start cycles", "c0", "10", None),
+                         ("End cycles", "c1", "100", None),
+                         ("Envelope", "env", "Blackman", ENV_CHOICES)]),
+    "Multitone":       (_build_multitone,
+                        [("Cycles (comma list)", "tones", "10, 20, 35", None),
+                         ("Envelope", "env", "None", ENV_CHOICES)]),
+    "Gaussian deriv":  (_build_dgauss,
+                        [("Truncate (+/-sigma)", "trunc", "3", None),
+                         ("Beta", "beta", "1", None)]),
+}
+BUILD_SLOTS = max(len(spec) for _, spec in BUILD_SHAPES.values())
+
+
+def build_waveform(shape, n_points, values):
+    """Make the samples for one shape. Pure - no instrument, no widgets."""
+    if shape not in BUILD_SHAPES:
+        raise ValueError(f"unknown shape {shape!r}")
+    n = int(n_points)
+    if n < 2:
+        raise ValueError("need at least 2 points")
+    if n % 2:
+        n += 1                              # the generator rejects odd counts
+    builder, _ = BUILD_SHAPES[shape]
+    p = _Params(values)
+    y = np.asarray(builder(n, p), dtype=np.float64)
+
+    cycles = p.num("cycles", 0.0)
+    if cycles > 0:
+        # An envelope times a carrier: the shape becomes the burst outline and
+        # the carrier fills it, which is how a Raman or Rabi pulse is specified.
+        phase = np.deg2rad(p.num("cphase", 0.0))
+        y = y * np.sin(2 * np.pi * cycles * _unit(n) + phase)
+    return y
+
+
+def parse_pasted(text):
+    """Read typed or pasted numbers into (2-D array, column names or None).
+
+    Same contract as read_table, so pasted data goes through the same column
+    picker: rows split on newlines, columns on commas, semicolons or whitespace.
+    A first row that is not numeric is taken as the column names.
+    """
+    rows, names = [], None
+    for line in text.strip().splitlines():
+        line = line.strip().lstrip("﻿")
+        if not line or line.startswith("#"):
+            continue
+        fields = [f for f in re.split(r"[,;\s]+", line) if f]
+        try:
+            rows.append([float(f) for f in fields])
+        except ValueError:
+            if not rows and names is None:
+                names = [f.strip('"') for f in fields]
+                continue
+            raise ValueError(f"cannot read this as numbers: {line[:60]}")
+    if not rows:
+        raise ValueError("no numbers found")
+
+    width = len(rows[0])
+    if any(len(r) != width for r in rows):
+        raise ValueError("rows do not all have the same number of columns")
+    data = np.asarray(rows, dtype=np.float64)
+    # Numbers typed across one line are a waveform, not one sample of many
+    # channels.
+    if data.shape[0] == 1 and data.shape[1] > 2:
+        data, names = data.T, None
+    return data, names
 
 
 # Column headings that are an x-axis rather than samples, so a file written as
@@ -519,7 +827,7 @@ class App:
         self.out_state = {ch: None for ch in CHANNELS}
 
         root.title("BK4063B AWG GUI")
-        win_w = min(1220, root.winfo_screenwidth() - 80)
+        win_w = min(1330, root.winfo_screenwidth() - 80)
         win_h = min(900, root.winfo_screenheight() - 120)
         root.geometry(f"{win_w}x{win_h}+40+20")
 
@@ -555,9 +863,13 @@ class App:
         self.sync = ttk.Label(bar, text="not read yet", foreground="#666")
         self.sync.pack(side="left", padx=6)
 
-        self.build_arb(left, pad)
         self.build_setups(left, pad)
+        # The waveform tools sit under the preview rather than in the left
+        # column: they are what the preview is showing, and the channel panels
+        # already fill the height on a laptop screen.
         self.build_preview(right, pad)
+        self.build_builder(right, pad)
+        self.build_arb(right, pad)
 
         # --- log
         lf = ttk.LabelFrame(right, text="Log")
@@ -698,6 +1010,110 @@ class App:
         holder.pack(side="left")
         return holder
 
+    def build_builder(self, parent, pad):
+        f = ttk.LabelFrame(parent, text="Build waveform")
+        f.pack(fill="x", **pad)
+
+        r = ttk.Frame(f)
+        r.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(r, text="Shape:").pack(side="left")
+        self.shape = tk.StringVar(value="Gaussian")
+        cb = ttk.Combobox(r, textvariable=self.shape, values=list(BUILD_SHAPES),
+                          width=17, state="readonly")
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda e: self.on_shape())
+        ttk.Label(r, text="Points:").pack(side="left", padx=(10, 2))
+        self.build_pts = tk.StringVar(value="10000")
+        ttk.Entry(r, textvariable=self.build_pts, width=9).pack(side="left")
+        ttk.Button(r, text="Build", command=self.do_build).pack(side="left", padx=(10, 4))
+        ttk.Button(r, text="Type/paste values...",
+                   command=self.do_paste).pack(side="left")
+
+        g = ttk.Frame(f)
+        g.pack(fill="x", padx=6, pady=(2, 6))
+        self.shape_labels, self.shape_vars, self.shape_boxes = [], [], []
+        for slot in range(BUILD_SLOTS):
+            row, col = divmod(slot, 3)
+            lab = ttk.Label(g, text="")
+            lab.grid(row=row, column=col * 2, sticky="e", padx=(0, 4), pady=1)
+            var = tk.StringVar()
+            box = ttk.Combobox(g, textvariable=var, width=13, state="normal")
+            box.grid(row=row, column=col * 2 + 1, sticky="w", padx=2, pady=1)
+            self.shape_labels.append(lab)
+            self.shape_vars.append(var)
+            self.shape_boxes.append(box)
+        self.on_shape()
+
+    def on_shape(self):
+        """Relabel the parameter slots for the shape now selected."""
+        spec = BUILD_SHAPES[self.shape.get()][1]
+        for slot in range(BUILD_SLOTS):
+            lab = self.shape_labels[slot]
+            var = self.shape_vars[slot]
+            box = self.shape_boxes[slot]
+            if slot < len(spec):
+                label, _key, default, choices = spec[slot]
+                lab.configure(text=label + ":", foreground="#000")
+                box.configure(values=list(choices) if choices else (),
+                              state="readonly" if choices else "normal")
+                var.set(default)
+            else:
+                lab.configure(text="")
+                box.configure(values=(), state="disabled")
+                var.set("")
+
+    def do_build(self):
+        shape = self.shape.get()
+        spec = BUILD_SHAPES[shape][1]
+        values = {spec[i][1]: self.shape_vars[i].get() for i in range(len(spec))}
+        try:
+            data = build_waveform(shape, int(float(self.build_pts.get())), values)
+        except Exception as exc:
+            self.log(f"Could not build {shape}: {exc}")
+            messagebox.showerror("Cannot build waveform", str(exc))
+            return
+        detail = ", ".join(f"{spec[i][0]}={self.shape_vars[i].get()}"
+                           for i in range(len(spec)) if self.shape_vars[i].get())
+        self.log(f"Built {shape}: {data.size} pts" + (f" ({detail})" if detail else ""))
+        self.take_table(data.reshape(-1, 1), None, f"built {shape}",
+                        shape.split("(")[0].strip().replace(" ", "_").lower())
+
+    def do_paste(self):
+        """Type or paste numbers straight in, instead of loading a file."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Type or paste values")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        ttk.Label(dlg, justify="left", text=(
+            "One sample per line, a single row of numbers, or columns separated\n"
+            "by commas, semicolons or spaces. A non-numeric first line is read\n"
+            "as column names. Blank lines and # comments are skipped.")
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        box = ttk.Frame(dlg)
+        box.pack(fill="both", expand=True, padx=8)
+        txt = tk.Text(box, width=58, height=16, wrap="none", font=("Consolas", 9))
+        bar = ttk.Scrollbar(box, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=bar.set)
+        txt.pack(side="left", fill="both", expand=True)
+        bar.pack(side="left", fill="y")
+
+        row = ttk.Frame(dlg)
+        row.pack(fill="x", padx=8, pady=8)
+
+        def use():
+            try:
+                table, names = parse_pasted(txt.get("1.0", "end"))
+            except Exception as exc:
+                messagebox.showerror("Cannot read values", str(exc), parent=dlg)
+                return
+            dlg.destroy()
+            self.take_table(table, names, "pasted values", "pasted")
+
+        ttk.Button(row, text="Use these values", command=use).pack(side="left")
+        ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
+        txt.focus_set()
+
     def build_arb(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Upload arbitrary waveform")
         f.pack(fill="x", **pad)
@@ -726,8 +1142,8 @@ class App:
         ttk.Combobox(r2, textvariable=self.arb_ch, values=[str(c) for c in CHANNELS],
                      width=3, state="readonly").pack(side="left", padx=4)
         self.norm = tk.BooleanVar(value=True)
-        ttk.Checkbutton(r2, text="normalise to full scale",
-                        variable=self.norm).pack(side="left", padx=8)
+        ttk.Checkbutton(r2, text="normalise to full scale", variable=self.norm,
+                        command=self.draw_preview).pack(side="left", padx=8)
         self.upload_btn = ttk.Button(r2, text="Upload", command=self.do_upload,
                                      state="disabled")
         self.upload_btn.pack(side="left", padx=4)
@@ -783,8 +1199,8 @@ class App:
         ttk.Label(r, text="Show:").pack(side="left")
         self.preview_ch = tk.StringVar(value="1")
         cb = ttk.Combobox(r, textvariable=self.preview_ch,
-                          values=[f"{c}" for c in CHANNELS], width=4,
-                          state="readonly")
+                          values=[f"CH{c}" for c in CHANNELS] + ["pending"],
+                          width=9, state="readonly")
         cb.pack(side="left", padx=4)
         cb.bind("<<ComboboxSelected>>", lambda e: self.draw_preview())
 
@@ -1154,20 +1570,28 @@ class App:
             messagebox.showerror("Cannot read file", str(exc))
             return
 
-        self.arb_table = table
-        self.arb_source = path
-        ncols = table.shape[1]
+        self.log(f"Loaded {path}")
+        self.take_table(table, names, path,
+                        os.path.splitext(os.path.basename(path))[0])
+
+    def take_table(self, table, names, source, suggested):
+        """Adopt a set of samples, wherever they came from - a file, a built
+        shape or pasted text. All three land here so they share the column
+        picker, the preview and the upload button."""
+        self.arb_table = np.asarray(table, dtype=np.float64)
+        self.arb_source = source
+        ncols = self.arb_table.shape[1]
         labels = [f"{i + 1}: {names[i]}" if names and i < len(names)
                   else f"column {i + 1}" for i in range(ncols)]
         self.arb_col_box.configure(values=labels,
                                    state="readonly" if ncols > 1 else "disabled")
         self.arb_col.set(labels[default_column(names, ncols)])
-
-        self.log(f"Loaded {path}")
-        self.log(f"  {table.shape[0]} rows x {ncols} column(s)"
-                 + (f": {', '.join(names)}" if names else ""))
-        self.arb_name.set(safe_name(os.path.splitext(os.path.basename(path))[0])[:16]
-                          or "wave2")
+        self.arb_name.set(safe_name(suggested)[:16] or "wave2")
+        if ncols > 1:
+            self.log(f"  {self.arb_table.shape[0]} rows x {ncols} columns"
+                     + (f": {', '.join(names)}" if names else ""))
+        if self.canvas is not None:
+            self.preview_ch.set("pending")     # show what is about to go up
         self.pick_column()
 
     def pick_column(self):
@@ -1345,10 +1769,43 @@ class App:
 
     # -- preview -----------------------------------------------------------
 
+    def draw_pending(self):
+        """The samples waiting to be uploaded, drawn as they will be stored:
+        sample index across, full scale of the DAC up the side. The volts they
+        come out at are set later by Ampl and Offset on the channel."""
+        self.ax.clear()
+        data = self.arb_samples
+        if data is None or data.size < 2:
+            self.ax.text(0.5, 0.5, "nothing built or loaded yet\n"
+                                   "use Build, or Load file, or Type/paste values",
+                         ha="center", va="center", transform=self.ax.transAxes,
+                         color="#666")
+            self.ax.set_xticks([])
+            self.ax.set_yticks([])
+        else:
+            peak = float(np.max(np.abs(data))) or 1.0
+            shown = data / peak if self.norm.get() else np.clip(data, -1.0, 1.0)
+            # Thin a long record down for drawing; 4000 points is well past what
+            # the canvas can resolve and keeps a 1 Mpt build responsive.
+            step = max(1, shown.size // 4000)
+            self.ax.plot(np.arange(0, shown.size, step), shown[::step], lw=0.8)
+            self.ax.axhline(0.0, color="#999", lw=0.5)
+            self.ax.set_xlabel("sample")
+            self.ax.set_ylabel("fraction of full scale")
+            self.ax.set_ylim(-1.08, 1.08)
+            self.ax.grid(alpha=0.3)
+            self.ax.set_title(f"{os.path.basename(self.arb_source)} - "
+                              f"{data.size} pts"
+                              + ("" if self.norm.get() else ", not normalised"),
+                              fontsize=9)
+        self.canvas.draw_idle()
+
     def draw_preview(self):
         if self.canvas is None:
             return
-        ch = int(self.preview_ch.get())
+        if self.preview_ch.get() == "pending":
+            return self.draw_pending()
+        ch = int(self.preview_ch.get().lstrip("CH") or 1)
         wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
         vals = {key: self.vars[f"C{ch}:BSWV:{key}"].get().strip()
                 for key, _, _ in WAVE_PARAMS}
