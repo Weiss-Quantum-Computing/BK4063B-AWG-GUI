@@ -815,6 +815,7 @@ class App:
         self.busy = False
         self.arb_samples = None       # samples loaded from disk, not yet uploaded
         self.arb_table = None         # every column of that file, for the picker
+        self.known_waves = {}         # name -> samples, for anything we uploaded
         self.arb_source = ""
         self.read_stamp = ""
 
@@ -1514,6 +1515,8 @@ class App:
                 for ch, blocks in plan.items():
                     self.log(f"Applying to CH{ch}:")
                     self.awg.apply_channel(ch, blocks, log=self.log)
+                    if blocks.get("ARWV"):
+                        self.report_arb_timing(ch)
                 fresh = {ch: self.awg.read_channel(ch) for ch in CHANNELS}
                 names = self.awg.user_waveforms()
                 self.root.after(0, lambda: self.after_read(fresh, names,
@@ -1522,6 +1525,30 @@ class App:
                 self.log(f"ERROR: {exc}")
                 self.root.after(0, lambda: self.set_busy(False))
         threading.Thread(target=work, daemon=True).start()
+
+    def report_arb_timing(self, ch):
+        """Say out loud what selecting an arb did to the frequency.
+
+        In TrueArb the frequency is not an independent setting: the points come
+        out at the sample clock, so freq = rate / points. Load a waveform of a
+        different length and the frequency moves on its own, which looks like
+        the generator changing a setting behind your back unless you know it is
+        arithmetic. Instrument thread only.
+        """
+        try:
+            wave = parse_reply(self.awg.query(f"C{ch}:BSWV?"))
+            srate = parse_reply(self.awg.query(f"C{ch}:SRATE?"))
+            freq = wave.get("FRQ")
+            if srate.get("MODE") == "TARB":
+                rate = srate.get("VALUE")
+                if isinstance(rate, float) and isinstance(freq, float) and freq:
+                    self.log(f"  CH{ch} TrueArb: {rate:,.0f} Sa/s over "
+                             f"{round(rate / freq):,} points -> {freq:g} Hz")
+            elif isinstance(freq, float):
+                self.log(f"  CH{ch} DDS: whole record plays once per period, "
+                         f"{freq:g} Hz")
+        except Exception:
+            pass                      # a log line is never worth failing over
 
     def toggle_output(self, ch, on):
         if self.busy or not self.awg.inst:
@@ -1635,6 +1662,14 @@ class App:
             try:
                 n = self.awg.upload_arb(ch, name, samples, normalize=norm)
                 self.log(f"Uploaded '{name}' ({n} pts) and selected it on CH{ch}")
+                # Keep the samples so the channel preview can draw this
+                # waveform whenever it is the one selected. The generator
+                # cannot read a stored waveform back out, so if we do not
+                # remember it here, nothing can ever show it.
+                kept = np.asarray(samples, dtype=np.float64).ravel()[:n]
+                if norm:
+                    kept = kept / (float(np.max(np.abs(kept))) or 1.0)
+                self.known_waves[name] = np.clip(kept, -1.0, 1.0)
                 blocks = {c: self.awg.read_channel(c) for c in CHANNELS}
                 names = self.awg.user_waveforms()
                 self.root.after(0, lambda: self.after_read(blocks, names,
@@ -1788,7 +1823,16 @@ class App:
             # Thin a long record down for drawing; 4000 points is well past what
             # the canvas can resolve and keeps a 1 Mpt build responsive.
             step = max(1, shown.size // 4000)
-            self.ax.plot(np.arange(0, shown.size, step), shown[::step], lw=0.8)
+            xs = np.arange(0, shown.size, step)
+            ys = shown[::step]
+            # The DAC holds each sample until the next one, so the trace is a
+            # staircase. Drawing it sloped would promise an interpolation the
+            # generator does not do - which is invisible on a smooth 50k record
+            # but is the whole shape of a ten-value list.
+            xs = np.append(xs, xs[-1] + step)
+            ys = np.append(ys, ys[-1])
+            marker = dict(marker="o", ms=3) if shown.size <= 400 else {}
+            self.ax.plot(xs, ys, drawstyle="steps-post", lw=0.9, **marker)
             self.ax.axhline(0.0, color="#999", lw=0.5)
             self.ax.set_xlabel("sample")
             self.ax.set_ylabel("fraction of full scale")
@@ -1809,26 +1853,32 @@ class App:
         wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
         vals = {key: self.vars[f"C{ch}:BSWV:{key}"].get().strip()
                 for key, _, _ in WAVE_PARAMS}
-        arb = self.arb_samples if (wvtp == "ARB" and self.arb_samples is not None
-                                   and int(self.arb_ch.get()) == ch) else None
+        # Follow the arb the channel actually has selected, not whatever was
+        # built last: switching the Arb wave dropdown has to change the picture,
+        # and showing the wrong samples is worse than showing none.
+        name = self.vars[f"C{ch}:ARWV:NAME"].get().strip()
+        arb = self.known_waves.get(name) if wvtp == "ARB" else None
         curve = preview_curve(wvtp, vals, arb=arb)
 
         self.ax.clear()
         if curve is None:
             msg = ("select a wave type" if not wvtp else
-                   f"CH{ch}: '{self.vars[f'C{ch}:ARWV:NAME'].get()}' lives on the "
-                   "generator\nload the file here to preview it")
+                   f"CH{ch}: '{name}' is stored on the generator, and its samples\n"
+                   "cannot be read back. Build or load it here to preview it.")
             self.ax.text(0.5, 0.5, msg, ha="center", va="center",
                          transform=self.ax.transAxes, color="#666")
             self.ax.set_xticks([])
             self.ax.set_yticks([])
         else:
             t, v = curve
-            self.ax.plot(t * 1e3, v, lw=1.2)
+            # An arb is a staircase - the DAC holds each sample - while a
+            # built-in wave really is continuous.
+            style = "steps-post" if arb is not None else "default"
+            self.ax.plot(t * 1e3, v, lw=1.0, drawstyle=style)
             self.ax.set_xlabel("time (ms)")
             self.ax.set_ylabel("volts")
             self.ax.grid(alpha=0.3)
-            src = " (from file)" if arb is not None else ""
+            src = f"  '{name}' ({arb.size} pts)" if arb is not None else ""
             self.ax.set_title(f"CH{ch}  {wvtp}{src}", fontsize=9)
         self.canvas.draw_idle()
 

@@ -190,6 +190,47 @@ Set by **Clock** on the channel, not by the file:
   points ÷ sample rate. Use this to preserve the original timing: a capture taken
   at 1 GSa/s replays at its true speed if you set the same rate.
 
+### Why the frequency moves when you change waveform
+
+In TrueArb the frequency is not an independent setting. The points leave at the
+sample clock, so
+
+```
+freq = sample rate / number of points
+```
+
+Select a waveform of a different length and the frequency *has* to change - the
+generator is not overriding you, it is doing arithmetic. Measured on this unit at
+600 Sa/s: a 1,000-point waveform gives 0.6 Hz, a 50,000-point one gives 0.012 Hz.
+Selecting a stored waveform can also reset the sample rate itself.
+
+Every Apply that changes the arb selection now logs what happened, so the number
+is visible rather than mysterious:
+
+```
+CH2 TrueArb: 600 Sa/s over 50,000 points -> 0.012 Hz
+```
+
+To hold the frequency across a waveform change, either use **DDS** - where the
+whole record is one period whatever its length - or set the sample rate to
+`freq x points` for the new waveform.
+
+One more wrinkle: a waveform can carry a frequency stored with it at upload time,
+which the generator restores when you select it. This app never writes one, but
+waveforms put there by other software may have one.
+
+### Samples are held, not interpolated
+
+The DAC holds each sample until the next one, so the output is a staircase. The
+preview draws it that way - `steps-post`, with a marker per sample when the
+record is short enough to see them. On a smooth 50,000-point record it makes no
+visible difference; on a ten-value list it is the entire shape.
+
+The **Interp** box writes the instrument's `INTER` parameter (`LINE` / `HOLD`),
+but the 4063B never reports it back in a `SRATE?` reply, so the box clears again
+after Apply and there is no way to confirm which mode is in force. Observed
+behaviour is hold.
+
 **Deleting** an uploaded waveform has to be done at the front panel
 (Utility -> Store/Recall) - the firmware exposes no SCPI for it.
 
