@@ -50,10 +50,12 @@ CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
                            "BK4063B-AWG-GUI", "config.json")
 
 # A copy of every waveform this app uploads, kept because the generator cannot
-# read a stored waveform back out: without this, a waveform uploaded in an
-# earlier session can never be drawn again. Beside the config, out of the
-# program folder so a git pull cannot clobber it.
-WAVE_CACHE = os.path.join(os.path.dirname(CONFIG_PATH), "uploaded")
+# read a stored waveform back out: without it, a waveform uploaded in an earlier
+# session can never be drawn again. It lives beside the program rather than in
+# %APPDATA% so the samples are somewhere you can actually get at them, which
+# also makes the folder work in both directions - drop a .npy in here named to
+# match a waveform on the generator and the preview will use it.
+WAVE_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Waveforms")
 
 CHANNELS = (1, 2)
 WAVE_TYPES = ("SINE", "SQUARE", "RAMP", "PULSE", "NOISE", "DC", "ARB")
@@ -1938,6 +1940,17 @@ class App:
 
     # -- preview -----------------------------------------------------------
 
+    def arb_style(self, ch):
+        """How the generator gets from one stored point to the next.
+
+        TrueArb clocks each point out and holds it, so the output is a
+        staircase. DDS resamples the record to land on the frequency you asked
+        for and ramps between points instead. Same samples, different shape on
+        a scope - so the preview has to follow the clock rather than assume.
+        """
+        tarb = self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB"
+        return ("steps-post", "held") if tarb else ("default", "interpolated")
+
     def draw_pending(self):
         """The samples waiting to be uploaded, drawn as they will be stored:
         sample index across, full scale of the DAC up the side. The volts they
@@ -1963,17 +1976,21 @@ class App:
             # staircase. Drawing it sloped would promise an interpolation the
             # generator does not do - which is invisible on a smooth 50k record
             # but is the whole shape of a ten-value list.
-            xs = np.append(xs, xs[-1] + step)
-            ys = np.append(ys, ys[-1])
+            style, how = self.arb_style(int(self.arb_ch.get()))
+            if style == "steps-post":
+                # steps-post has no segment after the final point, so the last
+                # sample's dwell would be missing without one more step.
+                xs = np.append(xs, xs[-1] + step)
+                ys = np.append(ys, ys[-1])
             marker = dict(marker="o", ms=3) if shown.size <= 400 else {}
-            self.ax.plot(xs, ys, drawstyle="steps-post", lw=0.9, **marker)
+            self.ax.plot(xs, ys, drawstyle=style, lw=0.9, **marker)
             self.ax.axhline(0.0, color="#999", lw=0.5)
             self.ax.set_xlabel("sample")
             self.ax.set_ylabel("fraction of full scale")
             self.ax.set_ylim(-1.08, 1.08)
             self.ax.grid(alpha=0.3)
             self.ax.set_title(f"{os.path.basename(self.arb_source)} - "
-                              f"{data.size} pts"
+                              f"{data.size} pts, CH{self.arb_ch.get()} {how}"
                               + ("" if self.norm.get() else ", not normalised"),
                               fontsize=9)
         self.canvas.draw_idle()
@@ -2005,14 +2022,14 @@ class App:
             self.ax.set_yticks([])
         else:
             t, v = curve
-            # An arb is a staircase - the DAC holds each sample - while a
-            # built-in wave really is continuous.
-            style = "steps-post" if arb is not None else "default"
+            # A built-in wave is continuous; an arb is held or interpolated
+            # depending on the clock.
+            style, how = self.arb_style(ch) if arb is not None else ("default", "")
             self.ax.plot(t * 1e3, v, lw=1.0, drawstyle=style)
             self.ax.set_xlabel("time (ms)")
             self.ax.set_ylabel("volts")
             self.ax.grid(alpha=0.3)
-            src = f"  '{name}' ({arb.size} pts)" if arb is not None else ""
+            src = f"  '{name}' ({arb.size} pts, {how})" if arb is not None else ""
             self.ax.set_title(f"CH{ch}  {wvtp}{src}", fontsize=9)
         self.canvas.draw_idle()
 

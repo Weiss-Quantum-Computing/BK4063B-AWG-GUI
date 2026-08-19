@@ -65,9 +65,10 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
 - **Mode** is one row because the instrument allows only one of modulation, sweep
   and burst at a time. Picking a mode relabels the parameter slots beneath it.
 - **Preview** draws what Apply *would* produce, computed locally from the panel -
-  not read back from the generator. An arb already loaded on the instrument
-  cannot be previewed (its samples are not readable over USB); load the file in
-  the upload box and the preview picks it up.
+  not read back from the generator, which cannot report its samples. An arb is
+  drawn from the local copy kept in `Waveforms/`, so anything uploaded through
+  this app previews even sessions later; one put there by other means shows a
+  note instead of a guess.
 
 ## Building a waveform in the panel
 
@@ -252,12 +253,22 @@ One more wrinkle: a waveform can carry a frequency stored with it at upload time
 which the generator restores when you select it. This app never writes one, but
 waveforms put there by other software may have one.
 
-### Samples are held, not interpolated
+### Held or interpolated - the clock decides
 
-The DAC holds each sample until the next one, so the output is a staircase. The
-preview draws it that way - `steps-post`, with a marker per sample when the
-record is short enough to see them. On a smooth 50,000-point record it makes no
-visible difference; on a ten-value list it is the entire shape.
+The same stored points come out as two different shapes depending on the clock,
+confirmed on a scope:
+
+![TrueArb holds each sample; DDS ramps between them](Waveforms/dds_vs_truearb.png)
+
+- **TrueArb** clocks each point out and holds it until the next, so the output is
+  a staircase and every value you wrote is a real flat level.
+- **DDS** resamples the record to land on the frequency you asked for, and ramps
+  from point to point rather than stepping.
+
+The preview follows the channel's **Clock** setting and says which it is drawing
+(`held` or `interpolated` in the title), so switching DDS ↔ TrueArb changes the
+picture. On a smooth 50,000-point record the difference is invisible; on a
+ten-value list it is the entire shape.
 
 The **Interp** box writes the instrument's `INTER` parameter, which chooses how
 the DAC gets from one sample to the next in TrueArb:
@@ -272,11 +283,13 @@ the DAC gets from one sample to the next in TrueArb:
 At a high sample rate the difference disappears into the analogue bandwidth; at a
 low one it is the whole character of the output.
 
-**Unverified on this unit.** `SRATE?` never echoes `INTER` back, whichever value
-is written, so the box clears after Apply and the app cannot show which mode is
-in force. Setting `LINE` and `HOLD` produced identical readback. Observed
-behaviour is hold, and the preview assumes it. Settling it takes a scope, a low
-sample rate and a handful of points.
+**Unverified on this unit, and probably not the setting you want anyway.**
+`SRATE?` never echoes `INTER` back whichever value is written, so the box clears
+after Apply and the app cannot show which mode is in force; `LINE` and `HOLD`
+produced identical readback. Note that the hold-versus-ramp behaviour you can
+actually see on a scope tracks the **Clock** setting, not this box - TrueArb
+holds, DDS ramps - so reach for Clock first. Whether `INTER` does anything on top
+of that is untested.
 
 ## Waveforms in generator memory
 
@@ -299,12 +312,18 @@ The generator will not read a stored waveform back out over USB: `WVDT?` times
 out and wedges the session. So a waveform uploaded in an earlier session is a
 name and nothing else, and cannot be drawn.
 
-Every upload therefore saves a copy to `%APPDATA%\BK4063B-AWG-GUI\uploaded\` as
-`.npy`, and those are loaded at startup — which is what lets the preview draw a
-waveform you uploaded days ago. What is stored is the normalised samples, i.e.
-what the DAC actually received, not the raw file. Waveforms already on the
-generator before this app existed show as `no local copy`; upload them again from
-source to get one.
+Every upload therefore saves a copy into `Waveforms/` as `.npy`, and those are
+loaded at startup, which is what lets the preview draw a waveform you uploaded
+days ago. What is stored is the normalised samples, i.e. what the DAC actually
+received, not the raw file.
+
+The folder works in both directions: any `.npy` in it is offered as a local copy
+under its filename, so dropping one in named to match a waveform already on the
+generator makes that waveform previewable without re-uploading it. Waveforms
+that predate this app show as `no local copy` until you do one or the other.
+
+Only `.csv` and `.png` in `Waveforms/` are tracked by git; uploaded `.npy` copies
+are bench artefacts and stay out, the same way captured data does.
 
 **Deleting** an uploaded waveform has to be done at the front panel
 (Utility -> Store/Recall) - the firmware exposes no SCPI for it.
