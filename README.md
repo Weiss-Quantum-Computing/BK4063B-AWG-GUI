@@ -71,17 +71,63 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
 
 ## Uploading an arbitrary waveform
 
-**Load file...** takes `.csv`, `.txt`, `.dat` or `.npy`. A two-column file is read
-as time,volts and the last column is used as the samples. Pick a name and a
-channel, then **Upload** - the waveform goes into the generator's user memory and
-is selected on that channel.
+**Load file...**, pick the column if you are asked, set a name and a channel, then
+**Upload**. The waveform goes into the generator's user memory and is selected on
+that channel.
 
-`normalise to full scale` scales the largest sample to the DAC's full scale. Turn
-it off if your samples are already in -1.0..+1.0 and you want the headroom kept
-exactly; anything outside that range is clipped.
+### What the file should look like
+
+`.csv`, `.txt`, `.dat` (text) or `.npy` (a NumPy array). Text files may use commas
+or whitespace, and **a header row is optional** - if the first line will not parse
+as numbers it is read as column names instead. All of these work:
+
+| Layout | Example |
+|--------|---------|
+| One sample per line | `0.0`⏎`0.707`⏎`1.0` |
+| One row of samples | `0.0, 0.707, 1.0` |
+| time, volts | `0.0,-1.0`⏎`1e-6,-0.99` |
+| Named columns | `time_s,volts`⏎`0.0,-1.0` |
+| Full scope capture | `time_s,CH1_V,CH2_V,...` |
+| `.npy` | `np.save("w.npy", samples)` |
+
+With more than one column the **Column** dropdown next to the file name chooses
+which one holds the samples, listing the header names when the file has them. The
+default skips an obvious x-axis (`time`, `time_s`, `t`, `index`, ...) and takes
+the first real data column. Change it and the preview follows, so you can see
+which trace you are about to upload.
+
+That default matters for a Scope Grab capture, whose columns are
+`time_s,CH1_...,CH2_...,CH3_...,CH4_...`: taking the *last* column would upload
+the trigger trace rather than the signal.
+
+### What the numbers mean
+
+**The file sets the shape; the panel sets the volts.** Sample values are not
+output voltages - the amplitude and offset actually produced come from **Ampl
+(Vpp)** and **Offset (V)** on the channel, exactly as for a built-in wave. A
+waveform captured at 0 to 5.8 V and one at -1 to +1 upload to the same thing.
+
+`normalise to full scale` (on by default) divides by the largest absolute sample,
+so the biggest excursion reaches the DAC's full scale. Asymmetry is kept: a
+capture sitting entirely above zero still comes out entirely above the offset,
+using half the range. Turn normalising off if your samples are already in
+-1.0..+1.0 and you want that headroom preserved exactly; anything beyond that
+range is clipped.
 
 Samples go out as signed 16-bit little-endian, matching the 4063B's 16-bit DAC.
 An odd point count is rejected by the instrument, so the last sample is dropped.
+There is no small size limit to design around - a 1,000,000-point record uploads
+in one go.
+
+### How fast it plays back
+
+Set by **Clock** on the channel, not by the file:
+
+- **DDS** - the whole record plays once per **Freq (Hz)** period, however many
+  points it holds. Use this to replay a captured transient at a chosen rate.
+- **TrueArb** - points clock out at the **Sa/s** you set, so the period is
+  points ÷ sample rate. Use this to preserve the original timing: a capture taken
+  at 1 GSa/s replays at its true speed if you set the same rate.
 
 **Deleting** an uploaded waveform has to be done at the front panel
 (Utility -> Store/Recall) - the firmware exposes no SCPI for it.

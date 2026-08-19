@@ -130,6 +130,54 @@ READ_ONLY_KEYS = {"PERI", "MAX_OUTPUT_AMP", "HLEV", "LLEV", "AMPVRMS",
                   "AMPDBM", "TRMD"}
 
 
+# Column headings that are an x-axis rather than samples, so a file written as
+# time,volts picks the volts by default.
+TIME_NAMES = {"time", "time_s", "times", "t", "t_s", "sec", "secs", "seconds",
+              "s", "x", "index", "n", "sample", "samples"}
+
+
+def read_table(path):
+    """Read a sample file into (2-D array of columns, column names or None).
+
+    Accepts .npy, or text with any delimiter: one sample per line, time,volts
+    pairs, or a full multi-column capture. A header row is detected by the
+    numeric parse failing on it and skipped - Scope Grab's own CSVs are headed
+    `time_s,CH1_V,...`, and replaying one of those here is the whole point.
+    """
+    if path.lower().endswith(".npy"):
+        data = np.asarray(np.load(path), dtype=np.float64)
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+        return data, None
+
+    delim = "," if path.lower().endswith(".csv") else None
+    names = None
+    try:
+        data = np.loadtxt(path, delimiter=delim, ndmin=2)
+    except ValueError:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            header = fh.readline()
+        names = [c.strip().strip('"') for c in header.split(delim or None)]
+        data = np.loadtxt(path, delimiter=delim, ndmin=2, skiprows=1)
+    data = np.asarray(data, dtype=np.float64)
+
+    # A single row of many values is a waveform written across the line, not a
+    # one-sample capture of many channels.
+    if data.shape[0] == 1 and data.shape[1] > 2:
+        data, names = data.T, None
+    return data, names
+
+
+def default_column(names, ncols):
+    """Which column is most likely to hold the samples."""
+    if names and len(names) == ncols:
+        for i, name in enumerate(names):
+            if name.strip().lstrip("#").strip().lower() not in TIME_NAMES:
+                return i
+    # Unnamed: a lone column is the data, and a pair is time,volts.
+    return 0 if ncols == 1 else 1
+
+
 def safe_name(text):
     """Trim a typed prefix down to something legal in a filename."""
     out = "".join("_" if c in BAD_NAME_CHARS else c for c in text.strip())
@@ -458,6 +506,7 @@ class App:
         self.msgs = queue.Queue()
         self.busy = False
         self.arb_samples = None       # samples loaded from disk, not yet uploaded
+        self.arb_table = None         # every column of that file, for the picker
         self.arb_source = ""
         self.read_stamp = ""
 
@@ -655,6 +704,15 @@ class App:
         r1 = ttk.Frame(f)
         r1.pack(fill="x", padx=6, pady=(6, 2))
         ttk.Button(r1, text="Load file...", command=self.pick_arb).pack(side="left")
+        ttk.Label(r1, text="Column:").pack(side="left", padx=(10, 2))
+        # Which column holds the samples. A multi-channel scope capture has
+        # several plausible answers, so it is shown rather than guessed at
+        # silently - picking the wrong one uploads the trigger trace.
+        self.arb_col = tk.StringVar()
+        self.arb_col_box = ttk.Combobox(r1, textvariable=self.arb_col, width=16,
+                                        state="disabled")
+        self.arb_col_box.pack(side="left")
+        self.arb_col_box.bind("<<ComboboxSelected>>", lambda e: self.pick_column())
         self.arb_info = ttk.Label(r1, text="no file loaded", foreground="#666")
         self.arb_info.pack(side="left", padx=8)
 
@@ -1088,31 +1146,49 @@ class App:
         if not path:
             return
         try:
-            if path.lower().endswith(".npy"):
-                data = np.load(path)
-            else:
-                data = np.loadtxt(path, delimiter="," if path.lower()
-                                  .endswith(".csv") else None, ndmin=2)
-            data = np.asarray(data, dtype=np.float64)
-            if data.ndim > 1:
-                # A two-column file is time,volts - the samples are the last column.
-                data = data[:, -1]
-            data = data.ravel()
-            if data.size < 2:
-                raise ValueError("fewer than 2 samples")
+            table, names = read_table(path)
+            if table.shape[0] < 2:
+                raise ValueError(f"only {table.shape[0]} sample(s) in the file")
         except Exception as exc:
             self.log(f"Could not read {os.path.basename(path)}: {exc}")
             messagebox.showerror("Cannot read file", str(exc))
             return
-        self.arb_samples = data
+
+        self.arb_table = table
         self.arb_source = path
-        note = f"{os.path.basename(path)} - {data.size} pts"
-        if data.size % 2:
-            note += " (odd count, last sample dropped)"
-        self.arb_info.configure(text=note, foreground="#000")
-        self.log(f"Loaded {data.size} samples from {path}")
+        ncols = table.shape[1]
+        labels = [f"{i + 1}: {names[i]}" if names and i < len(names)
+                  else f"column {i + 1}" for i in range(ncols)]
+        self.arb_col_box.configure(values=labels,
+                                   state="readonly" if ncols > 1 else "disabled")
+        self.arb_col.set(labels[default_column(names, ncols)])
+
+        self.log(f"Loaded {path}")
+        self.log(f"  {table.shape[0]} rows x {ncols} column(s)"
+                 + (f": {', '.join(names)}" if names else ""))
         self.arb_name.set(safe_name(os.path.splitext(os.path.basename(path))[0])[:16]
                           or "wave2")
+        self.pick_column()
+
+    def pick_column(self):
+        """Take the selected column of the loaded file as the samples."""
+        if self.arb_table is None:
+            return
+        try:
+            index = self.arb_col_box.cget("values").index(self.arb_col.get())
+        except ValueError:
+            index = 0
+        data = np.asarray(self.arb_table[:, index], dtype=np.float64).ravel()
+        self.arb_samples = data
+
+        note = f"{os.path.basename(self.arb_source)} - {data.size} pts"
+        if self.arb_table.shape[1] > 1:
+            note += f", col {index + 1}"
+        if data.size % 2:
+            note += " (odd count, last dropped)"
+        self.arb_info.configure(text=note, foreground="#000")
+        self.log(f"  using column {index + 1}: {data.size} pts, "
+                 f"{data.min():g} to {data.max():g}")
         self.set_busy(self.busy)
         self.draw_preview()
 
