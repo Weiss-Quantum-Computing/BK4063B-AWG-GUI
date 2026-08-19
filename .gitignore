@@ -10,3 +10,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# ...except the example waveforms, which are part of the project. The .txt and
+# .npy copies stay out: they are the same samples in another wrapper and the
+# generator script remakes them.
+!Waveforms/*.csv

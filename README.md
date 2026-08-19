@@ -119,6 +119,24 @@ An odd point count is rejected by the instrument, so the last sample is dropped.
 There is no small size limit to design around - a 1,000,000-point record uploads
 in one go.
 
+### A worked example
+
+`Waveforms/` holds one, with the script that made it:
+
+```
+python Waveforms/make_blackman_burst.py
+```
+
+10 ms of 100 kHz carrier under a Blackman envelope - 1000 carrier cycles,
+50,000 points at 50 samples per cycle, the window tapering to zero at both ends
+so the record joins onto itself when it repeats.
+
+![Blackman-windowed 100 kHz burst](Waveforms/blackman_100kHz_10ms.png)
+
+The sample rate baked into the file (5 MSa/s) is a resolution choice, nothing
+more - the file carries no timing. Setting Clock = TrueArb, Sa/s = 5e6 makes the
+generator report `PERI,0.01S`, which is the 10 ms back again.
+
 ### How fast it plays back
 
 Set by **Clock** on the channel, not by the file:
