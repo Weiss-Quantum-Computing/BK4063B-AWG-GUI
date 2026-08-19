@@ -55,8 +55,12 @@ control panel should not interrupt something the bench is in the middle of.
 Each channel gets output state, load and polarity; a wave type with its
 parameters; arb selection and sample clock; and one modulation/sweep/burst row.
 
-- **Greyed cells** are the parameters the selected wave type has no use for. They
-  are ignored by Apply even if they still hold a number from a previous type.
+- **Greyed cells** are the parameters the current settings give no meaning to,
+  and Apply ignores them even if they still hold a number from a previous type.
+  This works at two levels: the arb row only applies to `ARB`, and within it
+  **Sa/s** and **Interp** only apply to the **TrueArb** clock, since DDS derives
+  its timing from the frequency instead. A greyed cell still shows what the
+  generator reports - it just cannot be edited or sent.
 - **`*` markers** flag a cell you have edited but not applied yet, and the status
   line beside the buttons counts them. It reads `in sync (hh:mm:ss)` when the
   panel matches the generator.

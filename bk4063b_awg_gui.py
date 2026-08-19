@@ -870,6 +870,7 @@ class App:
         self.inst_vals = {}           # key -> value the generator last reported
         self.widgets = {}             # key -> the entry/combobox itself
         self.natural = {}             # key -> state to restore when re-enabled
+        self.arb_labels = {}          # key -> its caption, for greying out
         self.out_state = {ch: None for ch in CHANNELS}
 
         root.title("BK4063B AWG GUI")
@@ -1011,15 +1012,22 @@ class App:
         # --- arb selection and sample clock, only live for WVTP,ARB
         a = ttk.Frame(f)
         a.pack(fill="x", padx=6, pady=2)
-        ttk.Label(a, text="Arb wave:").grid(row=0, column=0, sticky="e", padx=(0, 4))
-        combo = self.cell(a, f"C{ch}:ARWV:NAME", (), 0, 1, 16)
-        setattr(self, f"arbcombo{ch}", combo)
-        ttk.Label(a, text="Clock:").grid(row=0, column=2, sticky="e", padx=(8, 4))
-        self.cell(a, f"C{ch}:SRATE:MODE", ("DDS", "TARB"), 0, 3, 8)
-        ttk.Label(a, text="Sa/s:").grid(row=0, column=4, sticky="e", padx=(8, 4))
-        self.cell(a, f"C{ch}:SRATE:VALUE", None, 0, 5, 11)
-        ttk.Label(a, text="Interp:").grid(row=0, column=6, sticky="e", padx=(8, 4))
-        self.cell(a, f"C{ch}:SRATE:INTER", ("LINE", "HOLD"), 0, 7, 8)
+        for col, (text, key, choices, width) in enumerate((
+                ("Arb wave:", f"C{ch}:ARWV:NAME", (), 16),
+                ("Clock:", f"C{ch}:SRATE:MODE", ("DDS", "TARB"), 8),
+                ("Sa/s:", f"C{ch}:SRATE:VALUE", None, 11),
+                ("Interp:", f"C{ch}:SRATE:INTER", ("LINE", "HOLD"), 8))):
+            label = ttk.Label(a, text=text)
+            label.grid(row=0, column=col * 2, sticky="e",
+                       padx=((0, 4) if col == 0 else (8, 4)))
+            self.arb_labels[key] = label
+            # The clock decides whether Sa/s and Interp mean anything, so it
+            # re-runs the same greying pass the wave type does.
+            widget = self.cell(a, key, choices, 0, col * 2 + 1, width,
+                               on_change=(lambda c=ch: self.on_wave_type(c))
+                               if key.endswith("SRATE:MODE") else None)
+            if key.endswith("ARWV:NAME"):
+                setattr(self, f"arbcombo{ch}", widget)
 
         # --- modulation / sweep / burst
         m = ttk.Frame(f)
@@ -1392,16 +1400,29 @@ class App:
                                 foreground="#060")
 
     def on_wave_type(self, ch):
-        """Grey out the parameters the selected wave type has no use for."""
+        """Grey out every cell the current settings give no meaning to.
+
+        Two levels: the arb cells only apply to WVTP,ARB, and within those the
+        sample rate and interpolation only apply to the TrueArb clock - under
+        DDS the generator derives the timing from the frequency instead, and
+        leaving an empty Sa/s box editable invites filling in a number that
+        goes nowhere.
+        """
         wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
         for key, _, applies in WAVE_PARAMS:
             on = wvtp in applies
             self.enable(f"C{ch}:BSWV:{key}", on)
             getattr(self, f"lab{ch}_{key}").configure(
                 foreground="#000" if on else "#aaa")
-        for key in (f"C{ch}:ARWV:NAME", f"C{ch}:SRATE:MODE",
-                    f"C{ch}:SRATE:VALUE", f"C{ch}:SRATE:INTER"):
-            self.enable(key, wvtp == "ARB")
+
+        arb = wvtp == "ARB"
+        tarb = arb and self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB"
+        for key, on in ((f"C{ch}:ARWV:NAME", arb), (f"C{ch}:SRATE:MODE", arb),
+                        (f"C{ch}:SRATE:VALUE", tarb), (f"C{ch}:SRATE:INTER", tarb)):
+            self.enable(key, on)
+            label = self.arb_labels.get(key)
+            if label is not None:
+                label.configure(foreground="#000" if on else "#aaa")
 
     def on_mode(self, ch):
         """Relabel the mode parameter slots for the mode now selected."""
@@ -1516,8 +1537,12 @@ class App:
         self.on_mode(ch)
 
         kept = 0
+        done = (f"C{ch}:BSWV:WVTP", f"C{ch}:MODE")
         for key, value in values.items():
-            if key.endswith(":WVTP") or key.endswith(":MODE"):
+            # Exact keys, not a suffix test: "C1:SRATE:MODE" also ends in
+            # ":MODE", and matching it here left the Clock cell permanently
+            # blank because it was skipped by the loop that fills the panel.
+            if key in done:
                 continue
             was_edited = self.edited(key)
             self.inst_vals[key] = value
