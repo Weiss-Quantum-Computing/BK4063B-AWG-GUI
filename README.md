@@ -103,6 +103,16 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
   from then on the value is yours.
 - **Apply sends only what you edited.** Untouched settings are not rewritten,
   which matters on a channel that is currently driving something.
+- **Discard changes** puts every cell back to what the generator last reported,
+  and **Read from generator** now overwrites unapplied edits rather than
+  carrying them - after asking. A read used to keep them, which left the panel
+  showing a mixture of what the instrument holds and what it does not, with
+  only the asterisks to tell the two apart.
+- **A refused command is reported.** The generator is asked `*ESR?` after every
+  write, and anything it objected to is named in the log and raised in a box.
+  Applies used to go out blind: a rejected command looked exactly like an
+  accepted one, and the read-back afterwards made the edit look as though it
+  had been silently thrown away.
 - **Mode** is one row because the instrument allows only one of modulation, sweep
   and burst at a time. Picking a mode relabels the parameter slots beneath it,
   and **moves the values to wherever the new mode keeps them**. A value survives
@@ -658,8 +668,9 @@ one is worse than no control. Set the clock instead.
 
 ## Waveforms in generator memory
 
-The list at the bottom left shows what the generator holds, and whether this app
-has a local copy of the samples.
+The list under **Upload arbitrary waveform** shows what the generator holds, and
+whether this app has a local copy of the samples - beside the upload that fills
+it, which is both where it belongs and where there is room for it.
 
 **There is no remote delete.** Confirmed by probing rather than assumed: `WVDT
 DEL`, `STL DEL`, `DELETE` and the whole SCPI `MMEM` subsystem all return
@@ -715,6 +726,30 @@ need SINE/SQUARE/RAMP/ARB. Ask for AM on a pulse carrier and you quietly get PWM
 The PWM half of that is checked in the panel - see [The panel](#the-panel) - since
 the generator will not raise it for you.
 
+### Burst parameters depend on each other
+
+A burst is the one block whose parameters constrain one another, and the
+generator does not quietly ignore one that does not apply in the state it is in
+— it **rejects the whole command**. Since `STATE,ON` went out a line earlier and
+none of the parameters landed, the burst comes straight back off, and the
+read-back after Apply makes it look as though the edits vanished. From the
+programming guide's `BTWV` table:
+
+| Parameter | Not valid when |
+|---|---|
+| `PRD` | carrier is NOISE, or `TRSR` is EXT |
+| `STPS` | carrier is NOISE or PULSE |
+| `DLAY` | `GATE_NCYC` is not NCYC, or carrier is NOISE |
+| `TIME` | `GATE_NCYC` is not NCYC, or carrier is NOISE |
+
+So `GATE_NCYC` and `TRSR` — the two that decide the others — are sent **first**,
+and the rest are dropped where they cannot apply. The guide is also explicit
+that `STATE` must be ON before any other burst parameter is set, which is why
+the state and the parameters are separate writes.
+
+`MDWV` and `SWWV` have no dependencies among the parameters this panel sends,
+which is why only burst misbehaved.
+
 ## Reading replies
 
 Query responses need more than a comma split. `MDWV`/`SWWV`/`BTWV` carry a bare
@@ -724,6 +759,15 @@ own - flattened, `FRQ` reports the carrier frequency instead of the modulating
 one. `parse_reply` handles both; the carrier comes back as a nested dict.
 
 ## Setups
+
+**Load/save setups...**, beside **Connect**, opens a window holding the folder,
+the filename prefix, the two buttons and the confirm-before-switching-an-output-on
+toggle. A window rather than a row on the panel because none of it is touched
+while tuning - it is what happens once at the start and once at the end, and the
+row it used to occupy was the height the generator's waveform list needed and
+could not get at the default window size. It is not modal: Save and Recall both
+go off to the instrument on a thread, and a grab would freeze the panel that
+reports what they did.
 
 **Save setup** writes both channels' full state. **Recall setup** applies one back,
 in the order above, leaving the output switches alone. Recall is byte-exact: every

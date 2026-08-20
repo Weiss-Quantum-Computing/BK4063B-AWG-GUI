@@ -168,6 +168,57 @@ MODE_SLOTS = max(len(p) for p in MODE_PARAMS.values())
 MODE_VERB = {"Sweep": "SWWV", "Burst": "BTWV"}
 MODE_VERBS = ("MDWV", "SWWV", "BTWV")
 
+# The burst parameters depend on one another, and the 4063B does not quietly
+# ignore one that does not apply in the state it is in - it rejects the whole
+# command. Since the state was switched on a line earlier and the parameters
+# never landed, the burst comes straight back off with nothing said about why.
+#
+# From the programming guide's BTWV table:
+#   PRD   not valid when the carrier is NOISE, or TRSR is EXT
+#   STPS  not valid when the carrier is NOISE or PULSE
+#   DLAY  available when GATE_NCYC is NCYC; not valid on a NOISE carrier
+#   TIME  available when GATE_NCYC is NCYC; not valid on a NOISE carrier
+# so the two parameters that decide the others are sent first and the rest are
+# dropped where they cannot apply. MDWV and SWWV have no dependencies among
+# the parameters this panel sends, which is why only burst misbehaved.
+MODE_LEADS = {"Burst": ("GATE_NCYC", "TRSR")}
+
+
+def mode_block(mode, params, wvtp=""):
+    """A mode block's parameters as (key, value) pairs, filtered and ordered.
+
+    `wvtp` is the carrier wave type, which decides some of it.
+    """
+    wvtp = str(wvtp or "").strip().upper()
+    keep = dict(params)
+    if mode == "Burst":
+        gate = str(keep.get("GATE_NCYC", "NCYC")).strip().upper()
+        trsr = str(keep.get("TRSR", "INT")).strip().upper()
+        drop = set()
+        if wvtp == "NOISE":
+            # Noise has no cycles to count, no phase to start at and no shape
+            # to gate, so only the trigger source survives.
+            drop |= {"PRD", "STPS", "GATE_NCYC", "DLAY", "TIME"}
+        if wvtp in ("NOISE", "PULSE"):
+            drop.add("STPS")
+        if gate != "NCYC":
+            drop |= {"DLAY", "TIME"}
+        if trsr == "EXT":
+            drop.add("PRD")           # the period is whatever the trigger says
+        keep = {k: v for k, v in keep.items() if k not in drop}
+    leads = MODE_LEADS.get(mode, ())
+    ordered = [(k, keep[k]) for k in leads if k in keep]
+    return ordered + [(k, v) for k, v in keep.items() if k not in leads]
+
+
+# Bits of the standard event status register worth repeating back. This
+# generator has no SYST:ERR? queue - it answers that query with a complaint
+# about the query itself - but *ESR? works, and reading it clears it.
+ESR_BITS = ((32, "command error - the generator did not understand it"),
+            (16, "execution error - understood, but not allowed in this state"),
+            (8, "device error"),
+            (4, "query error"))
+
 # Modulation types appear as a bare tag with no value, mid-response.
 _BARE_TAGS = {"AM", "DSBAM", "FM", "PM", "PWM", "ASK", "FSK", "PSK"}
 
@@ -1466,6 +1517,20 @@ class Awg:
     def wait(self):
         self.query("*OPC?")
 
+    def complaint(self):
+        """What the generator has objected to since this was last read, or "".
+
+        Reading clears it, so a check before a batch of writes starts them from
+        a clean slate. Without this an Apply goes out blind: a refused command
+        looks exactly like an accepted one, which is how a burst could come
+        back switched off with nothing said.
+        """
+        try:
+            status = int(self.query("*ESR?"))
+        except Exception:
+            return ""                 # no status register is not a failure
+        return "; ".join(text for bit, text in ESR_BITS if status & bit)
+
     # -- reading -----------------------------------------------------------
 
     def read_channel(self, ch):
@@ -1500,36 +1565,44 @@ class Awg:
 
         Get this wrong and the commands are all accepted, with the panel and the
         generator quietly disagreeing about what is being output.
+
+        Returns the commands the generator refused, which is nothing on a good
+        day and the whole point on a bad one.
         """
         prefix = f"C{ch}"
+        refused = []
+        self.complaint()              # start from a clean status register
+
+        def send(command):
+            self.write(command)
+            log(f"  {command}")
+            problem = self.complaint()
+            if problem:
+                refused.append(command)
+                log(f"    ^ refused: {problem}")
 
         outp = blocks.get("OUTP") or {}
         parts = [f"{k},{v}" for k, v in outp.items() if k != "STATE" and v != ""]
         if parts:
-            self.write(f"{prefix}:OUTP {','.join(parts)}")
-            log(f"  {prefix}:OUTP {','.join(parts)}")
+            send(f"{prefix}:OUTP {','.join(parts)}")
 
         arb = blocks.get("ARWV") or {}
         if arb.get("NAME"):
-            self.write(f"{prefix}:ARWV NAME,{arb['NAME']}")
-            log(f"  {prefix}:ARWV NAME,{arb['NAME']}")
+            send(f"{prefix}:ARWV NAME,{arb['NAME']}")
         elif arb.get("INDEX") not in (None, ""):
-            self.write(f"{prefix}:ARWV INDEX,{int(float(arb['INDEX']))}")
-            log(f"  {prefix}:ARWV INDEX,{int(float(arb['INDEX']))}")
+            send(f"{prefix}:ARWV INDEX,{int(float(arb['INDEX']))}")
 
         srate = blocks.get("SRATE") or {}
         if srate:
             args = ",".join(f"{k},{v}" for k, v in srate.items() if v != "")
             if args:
-                self.write(f"{prefix}:SRATE {args}")
-                log(f"  {prefix}:SRATE {args}")
+                send(f"{prefix}:SRATE {args}")
 
         bswv = blocks.get("BSWV") or {}
         if bswv:
             args = ",".join(f"{k},{v}" for k, v in bswv.items() if v != "")
             if args:
-                self.write(f"{prefix}:BSWV {args}")
-                log(f"  {prefix}:BSWV {args}")
+                send(f"{prefix}:BSWV {args}")
 
         if bswv.get("WVTP") == "ARB" and srate.get("MODE") == "TARB":
             # TrueArb quantises its clock against the loaded waveform, so the
@@ -1547,14 +1620,28 @@ class Awg:
                 verb = MODE_VERB.get(mode, "MDWV")
                 # STATE and the type tag have to be sent separately: combined,
                 # the instrument applies the state and drops the type switch.
-                self.write(f"{prefix}:{verb} STATE,ON")
-                args = ",".join(f"{k},{v}" for k, v in params.items() if v != "")
+                # The manual is explicit that STATE must be ON before any other
+                # parameter of a burst is set, so this ordering is required
+                # rather than merely tidy.
+                send(f"{prefix}:{verb} STATE,ON")
+                # Which burst parameters are legal depends on the carrier, so
+                # the wave type has to be known - from what is being sent where
+                # that is part of this apply, and from the generator otherwise.
+                carrier = (blocks.get("BSWV") or {}).get("WVTP", "")
+                if not carrier and mode == "Burst":
+                    try:
+                        carrier = str(parse_reply(
+                            self.query(f"{prefix}:BSWV?")).get("WVTP", ""))
+                    except Exception:
+                        carrier = ""
+                args = ",".join(f"{k},{v}" for k, v
+                                in mode_block(mode, params, carrier) if v != "")
                 lead = f"{mode}," if verb == "MDWV" else ""
                 if lead or args:
-                    self.write(f"{prefix}:{verb} {lead}{args}")
-                log(f"  {prefix}:{verb} STATE,ON / {lead}{args}")
+                    send(f"{prefix}:{verb} {lead}{args}")
             else:
                 log(f"  {prefix}: modulation, sweep and burst all off")
+        return refused
 
     def upload_arb(self, ch, name, samples, normalize=True):
         """Upload a waveform into user memory and select it on this channel.
@@ -1650,6 +1737,16 @@ class App:
 
         # The sequence lives on the app rather than in its window, so closing
         # the window and opening it again does not throw the sequence away.
+        # Held here rather than in the window that edits them, so that the
+        # saved config still loads and a save still works whether or not the
+        # setups window has ever been opened.
+        self.setup_win = None
+        self.outdir = tk.StringVar(value=os.path.join(
+            os.path.expanduser("~"), "Desktop", "awg_setups"))
+        self.prefix = tk.StringVar(value="awg")
+        self.confirm_output = tk.BooleanVar(value=True)
+        self.save_btn = self.recall_btn = None
+
         self.seq_win = None
         self.seq_data = [dict(SEQ_DEFAULT)]
         self.seq_vars = []
@@ -1683,6 +1780,8 @@ class App:
         self.status = ttk.Label(top, text="Not connected", foreground="#a00")
         self.status.pack(side="left")
         ttk.Button(top, text="Connect", command=self.do_connect).pack(side="right")
+        ttk.Button(top, text="Load/save setups...",
+                   command=self.do_setups).pack(side="right", padx=(0, 6))
 
         # --- one panel per channel
         for ch in CHANNELS:
@@ -1697,6 +1796,10 @@ class App:
         self.apply_btn = ttk.Button(bar, text="Apply changes",
                                     command=self.do_apply, state="disabled")
         self.apply_btn.pack(side="left", padx=6)
+        # Not gated on an instrument being attached: putting the panel back to
+        # what was last read is a thing the panel does to itself.
+        ttk.Button(bar, text="Discard changes",
+                   command=self.do_discard).pack(side="left", padx=(0, 6))
         self.sync = ttk.Label(bar, text="not read yet", foreground="#666")
         self.sync.pack(side="left", padx=6)
 
@@ -1708,14 +1811,16 @@ class App:
                   text=" computed from other settings, not set directly"
                   ).pack(side="left", padx=(4, 0))
 
-        self.build_setups(left, pad)
-        self.build_memory(left, pad)
         # The waveform tools sit under the preview rather than in the left
         # column: they are what the preview is showing, and the channel panels
         # already fill the height on a laptop screen.
         self.build_preview(right, pad)
         self.build_builder(right, pad)
         self.build_arb(right, pad)
+        # Beside the upload that fills it rather than under the channels, which
+        # is both where it belongs and where there is room: in the left column
+        # it was the section that got squeezed to nothing at the default size.
+        self.build_memory(right, pad)
 
         # --- log
         lf = ttk.LabelFrame(right, text="Log")
@@ -2631,37 +2736,70 @@ class App:
         self.show_ch[ch].set(True)
         self.log(f"CH{ch} set to '{name}' - press Apply changes to send it")
 
-    def build_setups(self, parent, pad):
-        f = ttk.LabelFrame(parent, text="Setups")
-        f.pack(fill="x", **pad)
-        of = ttk.Frame(f)
-        of.pack(fill="x", padx=6, pady=(6, 2))
-        default_dir = os.path.join(os.path.expanduser("~"), "Desktop", "awg_setups")
-        self.outdir = tk.StringVar(value=default_dir)
-        ttk.Entry(of, textvariable=self.outdir).pack(side="left", fill="x",
-                                                     expand=True)
+    def do_setups(self):
+        """Saving and recalling a whole instrument state, in its own window.
+
+        A window rather than a panel row because it is not something touched
+        while tuning - it is what happens once at the start and once at the
+        end. The row it used to occupy was the height the generator's waveform
+        list needed and could not get.
+
+        Not modal: Save and Recall both go off to the instrument on a thread,
+        and a grab here would freeze the panel that reports what they did.
+        """
+        if self.setup_win is not None and self.setup_win.winfo_exists():
+            self.setup_win.lift()
+            self.setup_win.focus_force()
+            return
+        win = self.setup_win = tk.Toplevel(self.root)
+        win.title("Load / save setups")
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._setups_close)
+
+        ttk.Label(win, justify="left", foreground="#444", text=(
+            "Save setup writes both channels' full state to a timestamped "
+            "JSON and a readable .txt beside it.\n"
+            "Recall setup applies one back, leaving the output switches alone.")
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        of = ttk.Frame(win)
+        of.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Label(of, text="Folder:").pack(side="left", padx=(0, 4))
+        ttk.Entry(of, textvariable=self.outdir, width=52).pack(
+            side="left", fill="x", expand=True)
         ttk.Button(of, text="...", width=3,
                    command=self.pick_dir).pack(side="left", padx=6)
 
-        pf = ttk.Frame(f)
-        pf.pack(fill="x", padx=6, pady=2)
+        pf = ttk.Frame(win)
+        pf.pack(fill="x", padx=8, pady=2)
         ttk.Label(pf, text="Prefix:").pack(side="left")
-        self.prefix = tk.StringVar(value="awg")
         ttk.Entry(pf, textvariable=self.prefix, width=16).pack(side="left", padx=4)
-        self.save_btn = ttk.Button(pf, text="Save setup", command=self.do_save_setup,
-                                   state="disabled")
+        self.save_btn = ttk.Button(pf, text="Save setup",
+                                   command=self.do_save_setup, state="disabled")
         self.save_btn.pack(side="left", padx=(8, 4))
         self.recall_btn = ttk.Button(pf, text="Recall setup...",
-                                     command=self.do_recall_setup, state="disabled")
+                                     command=self.do_recall_setup,
+                                     state="disabled")
         self.recall_btn.pack(side="left")
 
-        gf = ttk.Frame(f)
-        gf.pack(fill="x", padx=6, pady=(2, 6))
-        # Both default on. Turning an output on is the one thing here that can
-        # put a voltage into something that was not expecting it.
-        self.confirm_output = tk.BooleanVar(value=True)
+        gf = ttk.Frame(win)
+        gf.pack(fill="x", padx=8, pady=(6, 4))
+        # Defaults on. Turning an output on is the one thing in this app that
+        # can put a voltage into something that was not expecting it.
         ttk.Checkbutton(gf, text="confirm before switching an output on",
                         variable=self.confirm_output).pack(side="left")
+
+        ttk.Button(win, text="Close", command=self._setups_close).pack(
+            anchor="w", padx=8, pady=(4, 8))
+        # The two buttons are only live with an instrument attached, and this
+        # window may well have been opened before one was.
+        self.set_busy(self.busy)
+
+    def _setups_close(self):
+        if self.setup_win is not None:
+            self.setup_win.destroy()
+        self.setup_win = None
+        self.save_btn = self.recall_btn = None
 
     def build_preview(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Preview (what Apply would produce)")
@@ -2893,6 +3031,17 @@ class App:
         finally:
             self.quiet = False
 
+    def unapplied(self):
+        """The cells holding an edit that has not been sent.
+
+        The same rule the asterisks use: a greyed cell is not part of the
+        current settings and a derived one moved because something else was
+        typed, so neither is an edit waiting to go anywhere.
+        """
+        return [key for key in self.marks
+                if str(self.widgets[key].cget("state")) != "disabled"
+                and not self.derived(key) and self.edited(key)]
+
     def refresh_marks(self):
         if not hasattr(self, "sync"):
             return          # still building the panel
@@ -3045,9 +3194,12 @@ class App:
         self.busy = busy
         live = bool(self.awg.inst) and not busy
         state = "normal" if live else "disabled"
-        for btn in (self.read_btn, self.apply_btn, self.save_btn,
-                    self.recall_btn, self.mem_btn):
-            btn.configure(state=state)
+        buttons = [self.read_btn, self.apply_btn, self.mem_btn,
+                   self.save_btn, self.recall_btn]
+        for btn in buttons:
+            # Save and Recall live in a window that is usually not open.
+            if btn is not None and btn.winfo_exists():
+                btn.configure(state=state)
         for ch in CHANNELS:
             getattr(self, f"on_btn{ch}").configure(state=state)
             getattr(self, f"off_btn{ch}").configure(state=state)
@@ -3236,8 +3388,57 @@ class App:
         self.refresh_marks()
         self.draw_preview()
 
+    def do_discard(self):
+        """Put every cell back to what the generator last reported.
+
+        The counterpart to Apply, and the thing that was missing: an edit could
+        only ever be sent or quietly carried, never taken back.
+        """
+        pending = self.unapplied()
+        if not pending:
+            self.log("Nothing to discard - the panel matches the generator.")
+            return
+        note = ("" if self.read_stamp else
+                "\n\nNothing has been read from the generator yet, so this "
+                "will leave the panel empty.")
+        if not messagebox.askokcancel(
+                "Discard changes",
+                f"Put {len(pending)} unapplied change(s) back to what the "
+                f"generator last reported?{note}"):
+            return
+        # Loading, because none of this is the user typing: no mode row
+        # carry-over, no PWM complaint, no driver moving to whatever was
+        # written last.
+        self.loading = True
+        try:
+            for key, var in self.vars.items():
+                value = self.inst_vals.get(key, "")
+                if var.get().strip() != value:
+                    var.set(value)
+            self.computed.clear()
+            for ch in CHANNELS:
+                self.on_wave_type(ch)
+                self.on_mode(ch)
+        finally:
+            self.loading = False
+        self.refresh_marks()
+        self.draw_preview()
+        self.log(f"Discarded {len(pending)} unapplied change(s).")
+
     def do_read(self):
         if self.busy or not self.awg.inst:
+            return
+        pending = self.unapplied()
+        # A read used to keep unapplied edits, which left the panel showing a
+        # mixture of what the generator holds and what it does not, with only
+        # the asterisks to tell them apart. Overwriting is the honest thing;
+        # asking first is what makes it safe.
+        if pending and not messagebox.askyesno(
+                "Unapplied changes",
+                f"{len(pending)} change(s) have not been applied.\n\n"
+                "Reading will overwrite them with what the generator actually "
+                "holds.\n\nRead anyway?"):
+            self.log(f"Read cancelled - {len(pending)} unapplied change(s) kept.")
             return
         self.set_busy(True)
 
@@ -3245,8 +3446,11 @@ class App:
             try:
                 blocks = {ch: self.awg.read_channel(ch) for ch in CHANNELS}
                 names = self.awg.user_waveforms()
-                self.log("Read back from generator.")
-                self.root.after(0, lambda: self.after_read(blocks, names))
+                self.log("Read back from generator."
+                         + (f" {len(pending)} unapplied change(s) overwritten."
+                            if pending else ""))
+                self.root.after(0, lambda: self.after_read(blocks, names,
+                                                           overwrite=True))
             except Exception as exc:
                 self.log(f"ERROR: {exc}")
                 self.root.after(0, lambda: self.set_busy(False))
@@ -3289,11 +3493,24 @@ class App:
 
         def work():
             try:
+                refused = []
                 for ch, blocks in plan.items():
                     self.log(f"Applying to CH{ch}:")
-                    self.awg.apply_channel(ch, blocks, log=self.log)
+                    refused += self.awg.apply_channel(ch, blocks, log=self.log)
                     if blocks.get("ARWV"):
                         self.report_arb_timing(ch)
+                if refused:
+                    # Worth a box rather than a log line: a refused command is
+                    # exactly the case where the panel and the generator are
+                    # about to disagree, and the read-back below is what makes
+                    # the edit look like it was silently thrown away.
+                    self.root.after(0, lambda r=list(refused): messagebox.showwarning(
+                        "The generator refused a command",
+                        "These went out and came back rejected:\n\n"
+                        + "\n".join(r)
+                        + "\n\nThe panel is about to show what the generator "
+                          "actually holds, so anything in them is lost. The "
+                          "log says what it objected to."))
                 fresh = {ch: self.awg.read_channel(ch) for ch in CHANNELS}
                 names = self.awg.user_waveforms()
                 self.root.after(0, lambda: self.after_read(fresh, names,
