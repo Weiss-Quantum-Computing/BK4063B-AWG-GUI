@@ -130,6 +130,13 @@ SOURCES = ("INT", "EXT")
 # modes take any of SINE/SQUARE/RAMP/ARB.
 PWM_CARRIER = "PULSE"
 
+# Sweep and burst are not available while a channel's sample clock is TrueArb.
+# Measured, not inferred: BTWV STATE,ON and SWWV STATE,ON both read back OFF
+# under TARB and ON under DDS, reproducibly, while MDWV is unaffected. The
+# generator does not refuse the command - it accepts it and stays off, which is
+# why a burst set up from this panel looked like it was losing its settings.
+TARB_BLOCKS = ("Sweep", "Burst")
+
 # Modulation, sweep and burst are one panel row because the instrument treats
 # them as one setting: only one can be active at a time. Each entry is
 # (label, SCPI key, choices or None); choices make the cell a fixed dropdown.
@@ -167,57 +174,6 @@ MODE_SLOTS = max(len(p) for p in MODE_PARAMS.values())
 # enabled, because the instrument allows only one at a time.
 MODE_VERB = {"Sweep": "SWWV", "Burst": "BTWV"}
 MODE_VERBS = ("MDWV", "SWWV", "BTWV")
-
-# The burst parameters depend on one another, and the 4063B does not quietly
-# ignore one that does not apply in the state it is in - it rejects the whole
-# command. Since the state was switched on a line earlier and the parameters
-# never landed, the burst comes straight back off with nothing said about why.
-#
-# From the programming guide's BTWV table:
-#   PRD   not valid when the carrier is NOISE, or TRSR is EXT
-#   STPS  not valid when the carrier is NOISE or PULSE
-#   DLAY  available when GATE_NCYC is NCYC; not valid on a NOISE carrier
-#   TIME  available when GATE_NCYC is NCYC; not valid on a NOISE carrier
-# so the two parameters that decide the others are sent first and the rest are
-# dropped where they cannot apply. MDWV and SWWV have no dependencies among
-# the parameters this panel sends, which is why only burst misbehaved.
-MODE_LEADS = {"Burst": ("GATE_NCYC", "TRSR")}
-
-
-def mode_block(mode, params, wvtp=""):
-    """A mode block's parameters as (key, value) pairs, filtered and ordered.
-
-    `wvtp` is the carrier wave type, which decides some of it.
-    """
-    wvtp = str(wvtp or "").strip().upper()
-    keep = dict(params)
-    if mode == "Burst":
-        gate = str(keep.get("GATE_NCYC", "NCYC")).strip().upper()
-        trsr = str(keep.get("TRSR", "INT")).strip().upper()
-        drop = set()
-        if wvtp == "NOISE":
-            # Noise has no cycles to count, no phase to start at and no shape
-            # to gate, so only the trigger source survives.
-            drop |= {"PRD", "STPS", "GATE_NCYC", "DLAY", "TIME"}
-        if wvtp in ("NOISE", "PULSE"):
-            drop.add("STPS")
-        if gate != "NCYC":
-            drop |= {"DLAY", "TIME"}
-        if trsr == "EXT":
-            drop.add("PRD")           # the period is whatever the trigger says
-        keep = {k: v for k, v in keep.items() if k not in drop}
-    leads = MODE_LEADS.get(mode, ())
-    ordered = [(k, keep[k]) for k in leads if k in keep]
-    return ordered + [(k, v) for k, v in keep.items() if k not in leads]
-
-
-# Bits of the standard event status register worth repeating back. This
-# generator has no SYST:ERR? queue - it answers that query with a complaint
-# about the query itself - but *ESR? works, and reading it clears it.
-ESR_BITS = ((32, "command error - the generator did not understand it"),
-            (16, "execution error - understood, but not allowed in this state"),
-            (8, "device error"),
-            (4, "query error"))
 
 # Modulation types appear as a bare tag with no value, mid-response.
 _BARE_TAGS = {"AM", "DSBAM", "FM", "PM", "PWM", "ASK", "FSK", "PSK"}
@@ -1517,20 +1473,6 @@ class Awg:
     def wait(self):
         self.query("*OPC?")
 
-    def complaint(self):
-        """What the generator has objected to since this was last read, or "".
-
-        Reading clears it, so a check before a batch of writes starts them from
-        a clean slate. Without this an Apply goes out blind: a refused command
-        looks exactly like an accepted one, which is how a burst could come
-        back switched off with nothing said.
-        """
-        try:
-            status = int(self.query("*ESR?"))
-        except Exception:
-            return ""                 # no status register is not a failure
-        return "; ".join(text for bit, text in ESR_BITS if status & bit)
-
     # -- reading -----------------------------------------------------------
 
     def read_channel(self, ch):
@@ -1566,20 +1508,14 @@ class Awg:
         Get this wrong and the commands are all accepted, with the panel and the
         generator quietly disagreeing about what is being output.
 
-        Returns the commands the generator refused, which is nothing on a good
-        day and the whole point on a bad one.
+        Returns what did not take, which is nothing on a good day.
         """
         prefix = f"C{ch}"
-        refused = []
-        self.complaint()              # start from a clean status register
+        missed = []
 
         def send(command):
             self.write(command)
             log(f"  {command}")
-            problem = self.complaint()
-            if problem:
-                refused.append(command)
-                log(f"    ^ refused: {problem}")
 
         outp = blocks.get("OUTP") or {}
         parts = [f"{k},{v}" for k, v in outp.items() if k != "STATE" and v != ""]
@@ -1624,24 +1560,34 @@ class Awg:
                 # parameter of a burst is set, so this ordering is required
                 # rather than merely tidy.
                 send(f"{prefix}:{verb} STATE,ON")
-                # Which burst parameters are legal depends on the carrier, so
-                # the wave type has to be known - from what is being sent where
-                # that is part of this apply, and from the generator otherwise.
-                carrier = (blocks.get("BSWV") or {}).get("WVTP", "")
-                if not carrier and mode == "Burst":
-                    try:
-                        carrier = str(parse_reply(
-                            self.query(f"{prefix}:BSWV?")).get("WVTP", ""))
-                    except Exception:
-                        carrier = ""
-                args = ",".join(f"{k},{v}" for k, v
-                                in mode_block(mode, params, carrier) if v != "")
+                args = ",".join(f"{k},{v}" for k, v in params.items() if v != "")
                 lead = f"{mode}," if verb == "MDWV" else ""
                 if lead or args:
                     send(f"{prefix}:{verb} {lead}{args}")
+                # Read it back rather than trusting the write. There is no
+                # usable error channel on this generator: SYST:ERR? answers
+                # every query with the same complaint about the query itself,
+                # and *ESR? sets its command-error bit on every Cn: command
+                # whether it worked or not - a plain BSWV AMP,1 sets it. The
+                # state is the only thing that tells the truth.
+                missed += self.mode_took(ch, verb, mode)
             else:
                 log(f"  {prefix}: modulation, sweep and burst all off")
-        return refused
+        return missed
+
+    def mode_took(self, ch, verb, mode):
+        """Empty if the mode really is on, or one line saying it is not."""
+        try:
+            state = parse_reply(self.query(f"C{ch}:{verb}?")).get("STATE")
+            if state == "ON":
+                return []
+            clock = parse_reply(self.query(f"C{ch}:SRATE?")).get("MODE")
+        except Exception:
+            return []                 # a check that cannot run is not a failure
+        why = (" - the sample clock is TrueArb, and this generator allows only "
+               "modulation there. Set Clock to DDS on this channel."
+               if clock == "TARB" and mode in TARB_BLOCKS else "")
+        return [f"CH{ch} {mode} did not switch on{why}"]
 
     def upload_arb(self, ch, name, samples, normalize=True):
         """Upload a waveform into user memory and select it on this channel.
@@ -1731,7 +1677,7 @@ class App:
         # is remembered here: without it a switch of mode leaves the old values
         # sitting under the new labels.
         self.mode_shown = {ch: "Off" for ch in CHANNELS}
-        self.pwm_bad = {ch: False for ch in CHANNELS}
+        self.pwm_bad = {ch: () for ch in CHANNELS}
         self.loading = False          # panel being filled from the generator
         self.quiet = False            # a var write that is not a user edit
 
@@ -3159,30 +3105,49 @@ class App:
         finally:
             self.quiet = False
 
+    def mode_problem(self, ch):
+        """Why this channel's mode row will not take, as (title, message).
+
+        Both rules are ones the generator enforces by quietly doing something
+        else rather than by refusing, so the panel has to know them or the
+        settings just disappear on Apply.
+
+        PWM has nothing to widen unless the carrier is a pulse. Sweep and burst
+        are not available while the sample clock is TrueArb - measured on the
+        instrument, where STATE,ON is accepted and reads back OFF.
+        """
+        mode = self.vars[f"C{ch}:MODE"].get().strip()
+        if mode == "PWM" and self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper() \
+                != PWM_CARRIER:
+            return ("PWM carrier", "The carrier of PWM can only be pulse")
+        if mode in TARB_BLOCKS and \
+                self.vars[f"C{ch}:SRATE:MODE"].get().strip().upper() == "TARB":
+            return ("TrueArb clock",
+                    f"{mode} is not available while the sample clock is "
+                    f"TrueArb.\n\nSet Clock to DDS on CH{ch} first. "
+                    f"Modulation still works under TrueArb; sweep and burst "
+                    f"do not.")
+        return ()
+
     def pwm_ok(self, ch):
-        """PWM is the one mode the carrier constrains: there is nothing for it
-        to widen unless the wave type is PULSE."""
-        return (self.vars[f"C{ch}:MODE"].get().strip() != "PWM"
-                or self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
-                == PWM_CARRIER)
+        """True when the mode row is something this channel can actually do."""
+        return not self.mode_problem(ch)
 
     def check_pwm(self, ch):
-        """Say so, once, each time the panel newly asks for PWM on a carrier
-        that cannot carry it.
+        """Say so, once, each time the panel newly asks for a mode this channel
+        cannot do.
 
-        Called from both sides of the pair, since either the mode or the wave
-        type can be the half that just changed, and only on the way into the
-        bad state - otherwise every later keystroke on the channel would raise
-        the same box again.
+        Called from every side of it, since the mode, the wave type or the
+        sample clock can each be the thing that just changed, and only on the
+        way into the bad state - otherwise every later keystroke on the channel
+        would raise the same box again.
         """
-        bad = not self.pwm_ok(ch)
-        if bad and not self.pwm_bad[ch] and not self.loading:
-            wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip() or "(none)"
-            messagebox.showerror("PWM carrier",
-                                 "The carrier of PWM can only be pulse")
-            self.log(f"CH{ch}: PWM needs a {PWM_CARRIER} carrier, "
-                     f"and the wave type is {wvtp}.")
-        self.pwm_bad[ch] = bad
+        problem = self.mode_problem(ch)
+        if problem and problem != self.pwm_bad[ch] and not self.loading:
+            title, message = problem
+            messagebox.showerror(title, message)
+            self.log(f"CH{ch}: {message.splitlines()[0]}")
+        self.pwm_bad[ch] = problem
 
     def mode_key(self, ch, slot):
         """SCPI key the given mode slot currently stands for, or None."""
@@ -3304,7 +3269,7 @@ class App:
             self.loading = False
         # Whatever the generator turned out to be set to is the new baseline for
         # the complaint, so a panel read back in a bad state says so once.
-        self.pwm_bad[ch] = not self.pwm_ok(ch)
+        self.pwm_bad[ch] = self.mode_problem(ch)
 
         self.show_lamp(ch, parse_reply(blocks.get("OUTP", "")).get("STATE"))
         if kept:
@@ -3464,19 +3429,17 @@ class App:
         if not plan:
             self.log("No changes to apply.")
             return
-        # The generator takes PWM on a sine without complaint and then does
-        # something else with it, so the refusal has to happen here. Only the
-        # channels actually sending a mode block are in the way.
-        bad = [ch for ch, blocks in plan.items()
-               if "MODE" in blocks and not self.pwm_ok(ch)]
-        if bad:
-            messagebox.showerror("PWM carrier",
-                                 "The carrier of PWM can only be pulse")
-            self.log("Apply cancelled: "
-                     + " and ".join(f"CH{c}" for c in bad)
-                     + " asks for PWM on a carrier that is not "
-                     + f"{PWM_CARRIER}.")
-            return
+        # The generator takes both of these without complaint and then does
+        # something else, so the refusal has to happen here. Only the channels
+        # actually sending a mode block are in the way.
+        for ch, blocks in plan.items():
+            problem = self.mode_problem(ch) if "MODE" in blocks else ()
+            if problem:
+                title, message = problem
+                messagebox.showerror(title, message)
+                self.log(f"Apply cancelled: CH{ch} - "
+                         f"{message.splitlines()[0]}")
+                return
         # Changing the waveform under a channel that is already driving
         # something is a real change to the experiment, not just to the panel.
         live = [ch for ch in plan if self.out_state.get(ch) == "ON"]
@@ -3493,24 +3456,23 @@ class App:
 
         def work():
             try:
-                refused = []
+                missed = []
                 for ch, blocks in plan.items():
                     self.log(f"Applying to CH{ch}:")
-                    refused += self.awg.apply_channel(ch, blocks, log=self.log)
+                    missed += self.awg.apply_channel(ch, blocks, log=self.log)
                     if blocks.get("ARWV"):
                         self.report_arb_timing(ch)
-                if refused:
-                    # Worth a box rather than a log line: a refused command is
-                    # exactly the case where the panel and the generator are
-                    # about to disagree, and the read-back below is what makes
-                    # the edit look like it was silently thrown away.
-                    self.root.after(0, lambda r=list(refused): messagebox.showwarning(
-                        "The generator refused a command",
-                        "These went out and came back rejected:\n\n"
-                        + "\n".join(r)
+                for line in missed:
+                    self.log(f"  {line}")
+                if missed:
+                    # A box rather than a log line: this is exactly the case
+                    # where the read-back below makes an edit look as though it
+                    # was silently thrown away.
+                    self.root.after(0, lambda m=list(missed): messagebox.showwarning(
+                        "Not everything took",
+                        "\n\n".join(m)
                         + "\n\nThe panel is about to show what the generator "
-                          "actually holds, so anything in them is lost. The "
-                          "log says what it objected to."))
+                          "actually holds."))
                 fresh = {ch: self.awg.read_channel(ch) for ch in CHANNELS}
                 names = self.awg.user_waveforms()
                 self.root.after(0, lambda: self.after_read(fresh, names,

@@ -108,11 +108,11 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
   carrying them - after asking. A read used to keep them, which left the panel
   showing a mixture of what the instrument holds and what it does not, with
   only the asterisks to tell the two apart.
-- **A refused command is reported.** The generator is asked `*ESR?` after every
-  write, and anything it objected to is named in the log and raised in a box.
-  Applies used to go out blind: a rejected command looked exactly like an
-  accepted one, and the read-back afterwards made the edit look as though it
-  had been silently thrown away.
+- **A mode that does not come on is reported.** After Apply enables a
+  modulation, sweep or burst, the state is read back; if it did not take, the
+  log and a dialog say so, and name the sample clock where that is the reason.
+  There is no error channel on this generator to ask instead — see [There is no
+  usable error channel](#there-is-no-usable-error-channel).
 - **Mode** is one row because the instrument allows only one of modulation, sweep
   and burst at a time. Picking a mode relabels the parameter slots beneath it,
   and **moves the values to wherever the new mode keeps them**. A value survives
@@ -726,29 +726,36 @@ need SINE/SQUARE/RAMP/ARB. Ask for AM on a pulse carrier and you quietly get PWM
 The PWM half of that is checked in the panel - see [The panel](#the-panel) - since
 the generator will not raise it for you.
 
-### Burst parameters depend on each other
+### Sweep and burst need the DDS clock
 
-A burst is the one block whose parameters constrain one another, and the
-generator does not quietly ignore one that does not apply in the state it is in
-— it **rejects the whole command**. Since `STATE,ON` went out a line earlier and
-none of the parameters landed, the burst comes straight back off, and the
-read-back after Apply makes it look as though the edits vanished. From the
-programming guide's `BTWV` table:
+**Sweep and burst cannot be switched on while a channel's sample clock is
+TrueArb.** Modulation can. This is not in the programming guide; it was measured
+on the instrument, and the generator gives no sign of it — `BTWV STATE,ON` is
+accepted, returns no error, and reads back `STATE,OFF`:
 
-| Parameter | Not valid when |
-|---|---|
-| `PRD` | carrier is NOISE, or `TRSR` is EXT |
-| `STPS` | carrier is NOISE or PULSE |
-| `DLAY` | `GATE_NCYC` is not NCYC, or carrier is NOISE |
-| `TIME` | `GATE_NCYC` is not NCYC, or carrier is NOISE |
+| Clock | `MDWV STATE,ON` | `SWWV STATE,ON` | `BTWV STATE,ON` |
+|---|---|---|---|
+| DDS | on | on | on |
+| TrueArb | on | **stays off** | **stays off** |
 
-So `GATE_NCYC` and `TRSR` — the two that decide the others — are sent **first**,
-and the rest are dropped where they cannot apply. The guide is also explicit
-that `STATE` must be ON before any other burst parameter is set, which is why
-the state and the parameters are separate writes.
+That is why a burst set up from the panel appeared to lose its settings: the
+channel was in TrueArb from arb work, the burst never came on, and the read-back
+after Apply showed the mode as Off with the parameter cells empty. The panel now
+refuses the combination the way it refuses PWM on a sine — see [The
+panel](#the-panel) — and says which clock to change.
 
-`MDWV` and `SWWV` have no dependencies among the parameters this panel sends,
-which is why only burst misbehaved.
+### There is no usable error channel
+
+Worth knowing if you script this instrument yourself. It has **no `SYST:ERR?`
+queue**: that query answers `-108,"Parameter not allowed"` every time, about
+itself, and never drains. And **`*ESR?` is not an accept/reject signal** — it
+sets its command-error bit on essentially every `Cn:` vendor command, valid or
+not. A plain `C1:BSWV AMP,1` sets it.
+
+So there is no way to ask whether a command was taken. The only honest check is
+to read the setting back, which is what Apply does for the mode block: if the
+mode does not come back on, the log and a dialog say so rather than letting the
+read-back make it look as though the edit evaporated.
 
 ## Reading replies
 
