@@ -758,9 +758,11 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000, hold=True,
     if mode in ("AM", "DSBAM"):
         m = _mod_wave(mod.get("MDSP"), t * mnum("FRQ", 100.0))
         if mode == "AM":
-            # The convention bench generators use: at 0% depth the output is
-            # half amplitude, at 100% the envelope just reaches zero.
-            scale = (1.0 + mnum("DEPTH", 100.0) / 100.0 * m) / 2.0
+            # Measured on the instrument, not assumed: 0% depth leaves the
+            # amplitude alone and 100% doubles the peak, so the scale is
+            # 1 + m, not the (1 + m)/2 that Keysight-style generators use and
+            # that this drew at half height until it was checked on a scope.
+            scale = 1.0 + mnum("DEPTH", 100.0) / 100.0 * m
         else:
             scale = m                            # suppressed carrier
     elif mode == "FM":

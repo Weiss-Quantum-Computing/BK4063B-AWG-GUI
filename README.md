@@ -76,11 +76,14 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
 
 ### Output load
 
-The dropdown offers `50` and `HZ`, which is what the generator's own front panel
-offers. The box is typeable, though, because the remote interface accepts
-anything from 50 ohm up to 100k and reads it back - 49 gets clamped to 50. A load
-set that way is real but will not show on the instrument's screen, so it is worth
-knowing you set it.
+The dropdown offers `50` and `HZ`. Those are the two the generator's front-panel
+menu buttons give you, and in practice the two anyone wants.
+
+The instrument itself is not limited to them - it accepts any load from 50 ohm up
+to 100k, displays it on its own screen, and reads it back over SCPI (49 gets
+clamped to 50). The dropdown stays short on purpose rather than because of a
+limitation: an unusual load silently rescales every amplitude you set, so it is
+not something to reach for by accident. The cell is typeable if you do want one.
 
 Whatever it says, the declared load rescales amplitude: see
 [Command ordering](#command-ordering).
@@ -330,14 +333,26 @@ guess: a **gated burst**, which follows an external signal this app knows nothin
 about, and an **arb with no local copy**, whose samples the generator will not
 report.
 
-One caveat worth keeping in mind. The shapes come from the standard definitions -
-AM at 0% depth is half amplitude and at 100% just reaches zero, FM deviation is
-peak, PM deviation is in degrees - and they are checked against arithmetic
-(a ±500 Hz square FM on a 1 kHz carrier gives exactly 150 zero crossings in the
-high half and 50 in the low). They have **not** been checked against this
-generator's analogue output, so if a depth or deviation convention differs
-slightly, the preview will differ with it. The scope on the bench settles any
-case where that matters.
+**AM depth** follows this generator, which is not the textbook convention:
+
+| Depth | Peak output |
+|-------|-------------|
+| 0% | unchanged from no modulation |
+| 50% | 0.5x to 1.5x |
+| 100% | zero to **twice** the set amplitude |
+
+So the scale is `1 + m`, not the `(1 + m)/2` that Keysight-style generators use.
+The preview drew AM at half height until this was measured on a scope. Note that
+100% depth really does ask for double the amplitude, so a carrier set near the
+output limit will not have the headroom to deliver it.
+
+The remaining conventions are the standard definitions - FM deviation is peak, PM
+deviation is in degrees, keying is a square alternation - and they are checked
+against arithmetic (a ±500 Hz square FM on a 1 kHz carrier gives exactly 150 zero
+crossings in the high half and 50 in the low). Unlike AM they have **not** been
+confirmed against the generator's analogue output, so a convention could differ
+the same way AM's did. The scope settles any case where it matters, and a
+correction here is worth making.
 
 ### separate Y axes
 
