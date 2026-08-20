@@ -67,17 +67,20 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
 - **Yellow-tinted cells** hold a value that follows from other settings rather
   than one that was set. Two ways that happens.
 
-  The first is a pair the generator keeps in step. Under **TrueArb** the record
-  clocks out point by point, so `freq = Sa/s / points` - and the point count
-  belongs to the waveform, not to the panel. That leaves `Freq (Hz)` and `Sa/s`
-  as one setting seen two ways, and **the tint follows whichever you did not
-  type in**: set a rate and the frequency is the arithmetic, type a frequency
-  and the rate becomes the arithmetic instead. `Sa/s` drives until you say
-  otherwise, since that is what a TrueArb record is actually clocked by. See
-  [Why the frequency moves when you change
-  waveform](#why-the-frequency-moves-when-you-change-waveform). Under DDS
-  neither is tinted - the record is one period whatever its length, so the
-  frequency really is a setting.
+  The first is a pair the generator keeps in step - one setting seen two ways,
+  where **the tint follows whichever you did not type in**. Set either half and
+  the other becomes the arithmetic; type in the tinted one and they swap. Each
+  channel tracks its own answer.
+
+  | Wave type | The pair | Leads until you say otherwise |
+  |---|---|---|
+  | `ARB` on the **TrueArb** clock | `Sa/s` and `Freq (Hz)`, since `freq = Sa/s / points` and the point count belongs to the waveform | `Sa/s`, being what the record is actually clocked by |
+  | `PULSE` | `Width (s)` and `Duty (%)`, since `width = duty / 100 / freq` | `Width (s)`, being the absolute one |
+
+  Neither pair is tinted where it is not real: under **DDS** the record is one
+  period whatever its length, so the frequency genuinely is a setting, and a
+  `SQUARE` has a duty but no width to pair it with. See [Why the frequency moves
+  when you change waveform](#why-the-frequency-moves-when-you-change-waveform).
 
   The second is a value this app worked out, which is what the
   [sequence](#sequences) builder does when it puts the clock a timed record
@@ -281,12 +284,28 @@ reads it back, so a sequence can live in a `.txt` beside the data it produced or
 come out of a script:
 
 ```
-# BK4063B sequence at 1e8 Sa/s, bare times in us
+# BK4063B sequence
+# rate: 1e8
+# unit: us
+# baseline: 0
+# coherent: off
+# clock: on
+#
 # shape, time, ampl, freq, phase, gap, extra
 Blackman, 2, 1, 5e6, 0, 10
 Blackman, 2, 0.5, 5e6, 90, 10
 Blackman, 4, 1, 4.8e6, 0, 0
 ```
+
+The `# rate:` block carries the settings above the list, and pasting restores
+them along with the rows - the same rows at the wrong clock are a different
+waveform, and nothing in a row says which. They stay comments so a spec written
+by hand with nothing but rows still reads, in which case the window is left as
+it was rather than reset to defaults nobody asked for. Any other `#` line is an
+ordinary comment.
+
+Numbers are written through as the strings you typed, so a rate entered `1e8`
+comes back `1e8` rather than `100000000`.
 
 Everything after the sixth comma is the Extra field, so a value with commas of
 its own - `tones=10,20,35` - survives. Blank lines and `#` comments are skipped,

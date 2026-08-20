@@ -527,6 +527,20 @@ SEQ_COLUMNS = [("Shape", "shape", "Blackman", 16),
 
 SEQ_DEFAULT = {key: default for _, key, default, _ in SEQ_COLUMNS}
 
+# Settings a spec carries besides its segments. Without them a pasted sequence
+# is only half of itself: the same rows at the wrong clock are a different
+# waveform, and there is nothing in a row that says which.
+SEQ_SETTINGS = ("rate", "unit", "baseline", "coherent", "clock")
+
+
+def _as_bool(text, default=False):
+    value = str(text or "").strip().lower()
+    if value in ("on", "yes", "true", "1"):
+        return True
+    if value in ("off", "no", "false", "0"):
+        return False
+    return default
+
 
 def _secs(value):
     for scale, suffix in ((1.0, " s"), (1e-3, " ms"), (1e-6, " us"),
@@ -723,18 +737,30 @@ def sequence_extent(segments, rate, unit="us"):
 
 
 def parse_sequence_spec(text):
-    """Read a typed or pasted sequence back into segments.
+    """Read a typed or pasted sequence back as (segments, settings).
 
     One segment per line, fields in the order of SEQ_COLUMNS. Everything after
     the sixth comma is the extra field, so a value with commas of its own
     survives. Blank lines and # comments are skipped, as they are everywhere
-    else numbers are pasted in.
+    else numbers are pasted in - except a comment of the form `# rate: 1e8`,
+    which is how the spec carries the settings that are not per-segment. They
+    stay comments so that a spec written by hand without them still reads, and
+    so that the whole thing is still a file somebody can follow.
+
+    `settings` holds only the keys the text actually mentioned, and holds them
+    as the strings they were written as: a rate typed 1e8 comes back 1e8 rather
+    than 100000000.
     """
     keys = [key for _, key, _, _ in SEQ_COLUMNS]
-    out = []
+    out, settings = [], {}
     for number, line in enumerate(str(text or "").splitlines(), 1):
         line = line.strip().lstrip("\ufeff")
-        if not line or line.startswith("#"):
+        if not line:
+            continue
+        if line.startswith("#"):
+            name, sep, value = line.lstrip("#").strip().partition(":")
+            if sep and name.strip().lower() in SEQ_SETTINGS:
+                settings[name.strip().lower()] = value.strip()
             continue
         fields = [f.strip() for f in line.split(",", len(keys) - 1)]
         try:
@@ -746,14 +772,26 @@ def parse_sequence_spec(text):
         out.append({key: seg.get(key, "") for key in keys})
     if not out:
         raise ValueError("no segments found in that text")
-    return out
+    return out, settings
 
 
-def format_sequence_spec(segments, rate, unit="us"):
-    """Segments back out as the text `parse_sequence_spec` reads."""
+def format_sequence_spec(segments, rate, unit="us", baseline="0",
+                         coherent=False, clock=True):
+    """Segments and settings back out as the text `parse_sequence_spec` reads.
+
+    `rate` and `baseline` are written through as the strings they were typed
+    as, so a spec copied out and pasted back leaves the boxes exactly as they
+    were rather than normalising 1e8 into 100000000.
+    """
     keys = [key for _, key, _, _ in SEQ_COLUMNS]
-    lines = [f"# BK4063B sequence at {rate} Sa/s, bare times in {unit}",
-             "# " + ", ".join(key for _, key, _, _ in SEQ_COLUMNS)]
+    lines = ["# BK4063B sequence",
+             f"# rate: {rate}",
+             f"# unit: {unit}",
+             f"# baseline: {baseline}",
+             f"# coherent: {'on' if coherent else 'off'}",
+             f"# clock: {'on' if clock else 'off'}",
+             "#",
+             "# " + ", ".join(keys)]
     for seg in segments:
         if not str(seg.get("shape", "")).strip():
             continue
@@ -2150,9 +2188,35 @@ class App:
         self.log(f"  CH{ch} panel set to ARB / TrueArb / {rate:.10g} Sa/s "
                  "- not applied yet")
 
+    def _seq_spec(self):
+        """The sequence as text: the rows, and the settings that frame them."""
+        return format_sequence_spec(
+            self.seq_data, self.seq_rate.get().strip(), self.seq_unit.get(),
+            baseline=self.seq_baseline.get().strip(),
+            coherent=bool(self.seq_coherent.get()),
+            clock=bool(self.seq_set_clock.get()))
+
+    def _seq_apply_settings(self, settings):
+        """Put a pasted spec's settings into the boxes that hold them.
+
+        Only what the text actually mentioned: a spec written by hand with
+        nothing but rows leaves the window as it was, rather than resetting it
+        to defaults nobody asked for.
+        """
+        for name, var in (("rate", self.seq_rate),
+                          ("baseline", self.seq_baseline)):
+            if settings.get(name):
+                var.set(settings[name])
+        unit = settings.get("unit", "").strip().lower()
+        if unit in SEQ_UNITS:
+            self.seq_unit.set(unit)
+        for name, var in (("coherent", self.seq_coherent),
+                          ("clock", self.seq_set_clock)):
+            if name in settings:
+                var.set(_as_bool(settings[name], bool(var.get())))
+
     def _seq_copy(self):
-        text = format_sequence_spec(self.seq_data, self.seq_rate.get().strip(),
-                                    self.seq_unit.get())
+        text = self._seq_spec()
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.log(f"Sequence spec copied to the clipboard "
@@ -2174,7 +2238,9 @@ class App:
                 key for _, key, _, _ in SEQ_COLUMNS) + ".\n"
             "Everything after the sixth comma is the extra field, so a value "
             "with commas of its own survives.\n"
-            "Blank lines and # comments are skipped. Using this replaces the "
+            "The `# rate:` lines carry the settings above the list and are "
+            "read back with the rows; other\n"
+            "# comments and blank lines are skipped. Using this replaces the "
             "whole sequence.")
         ).pack(anchor="w", padx=8, pady=(8, 4))
 
@@ -2186,24 +2252,27 @@ class App:
         txt.configure(yscrollcommand=scroll.set)
         txt.pack(side="left", fill="both", expand=True)
         scroll.pack(side="left", fill="y")
-        txt.insert("1.0", format_sequence_spec(self.seq_data,
-                                               self.seq_rate.get().strip(),
-                                               self.seq_unit.get()))
+        txt.insert("1.0", self._seq_spec())
 
         row = ttk.Frame(dlg)
         row.pack(fill="x", padx=8, pady=8)
 
         def use():
             try:
-                data = parse_sequence_spec(txt.get("1.0", "end"))
+                data, settings = parse_sequence_spec(txt.get("1.0", "end"))
             except Exception as exc:
                 messagebox.showerror("Cannot read sequence", str(exc),
                                      parent=dlg)
                 return
             dlg.destroy()
             self.seq_data = data
+            # Settings before the redraw: the running total under the list is
+            # computed against the rate and the unit, so landing the rows first
+            # would show a length that was never true.
+            self._seq_apply_settings(settings)
             self._seq_redraw()
-            self.log(f"Sequence spec read: {len(data)} segments")
+            named = ", ".join(sorted(settings)) if settings else "no settings"
+            self.log(f"Sequence spec read: {len(data)} segments ({named})")
 
         ttk.Button(row, text="Use this sequence", command=use).pack(side="left")
         ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="left",
@@ -2525,24 +2594,42 @@ class App:
         """True if the panel value differs from what the generator last said."""
         return self.vars[key].get().strip() != self.inst_vals[key]
 
-    def linked_group(self, key):
-        """The cells this one is locked to, or () when it stands alone.
+    def linked_groups(self, ch):
+        """Cells on this channel that are one setting in two guises.
 
-        Under TrueArb the record clocks out point by point, so `freq = rate /
-        points` - and the point count belongs to the waveform, not to the
-        panel. That leaves the frequency and the sample rate as one setting
-        seen two ways: set either and the generator works the other out. Which
-        of them is a setting and which is arithmetic is therefore not fixed,
-        it is whichever was typed in last.
+        Set either half and the generator works the other out, so which of them
+        is a setting and which is arithmetic is not fixed - it is whichever was
+        typed in last. Each group is ordered with the half that drives it until
+        told otherwise first.
+
+        Both groups depend on the wave type, which is why this is computed
+        rather than a constant: a pulse has no sample clock to speak of and an
+        arb has no duty cycle.
         """
+        wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
+        groups = []
+        # TrueArb clocks the record out point by point, so freq = rate /
+        # points, and the point count belongs to the waveform rather than to
+        # the panel. Sa/s leads: it is what the record is actually clocked by,
+        # and what the sequence builder fills in.
+        if wvtp == "ARB" and \
+                self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB":
+            groups.append((f"C{ch}:SRATE:VALUE", f"C{ch}:BSWV:FRQ"))
+        # A pulse width is its duty against the period: width = duty / 100 /
+        # freq. Width leads, being the absolute one - and the one the preview
+        # already prefers when both are set.
+        if wvtp == "PULSE":
+            groups.append((f"C{ch}:BSWV:WIDTH", f"C{ch}:BSWV:DUTY"))
+        return groups
+
+    def linked_group(self, key):
+        """The group `key` belongs to as things stand, or () when it stands
+        alone."""
         for ch in CHANNELS:
-            group = (f"C{ch}:SRATE:VALUE", f"C{ch}:BSWV:FRQ")
-            if key not in group:
-                continue
-            live = (self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB"
-                    and self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
-                    == "ARB")
-            return group if live else ()
+            if key.startswith(f"C{ch}:"):
+                for group in self.linked_groups(ch):
+                    if key in group:
+                        return group
         return ()
 
     def is_computed(self, key):
@@ -3386,8 +3473,21 @@ class App:
             self.ax = self.axes[0]
             self.ax2 = self.ax.twinx() if twin else None
             # Stacked panels need room between them for a whole x axis each,
-            # and the figure has to grow or they end up two slivers.
-            self.fig.set_size_inches(5.6, 3.0 + 1.15 * (panels - 1))
+            # so the plot has to grow or they end up two slivers.
+            #
+            # Growing the Figure alone does not do it, three times over. The
+            # width has to be carried across or it snaps back to the 5.6 it
+            # was built with, and the figure then renders small over whatever
+            # the widget was showing before. The widget keeps its own
+            # requested height, so the pane never makes room. And the canvas
+            # syncs the figure *from* the widget on every <Configure>, so a
+            # height set only on the figure is undone by the first window
+            # resize. The widget's height is the thing to set; the figure is
+            # set to match so that this draw is already the right size.
+            height = 3.0 + 1.15 * (panels - 1)
+            self.fig.set_size_inches(self.fig.get_figwidth(), height)
+            self.canvas.get_tk_widget().configure(
+                height=int(round(height * self.fig.dpi)))
             self.fig.subplots_adjust(left=0.14, right=0.86, top=0.90,
                                      bottom=0.18, hspace=0.75)
             self.axes_key = key
