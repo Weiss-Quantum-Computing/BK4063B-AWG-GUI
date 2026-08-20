@@ -529,6 +529,11 @@ def build_warnings(shape, n_points, values, rate=0.0, carrier_hz=None):
 # a record: the whole point is that its segments differ in length, and "2 us at
 # 5 MHz" is how a pulse is specified at the bench. That makes the clock part of
 # the specification rather than something chosen afterwards.
+# How many points will go into the Type/paste box. A Tk text widget holding a
+# line per sample is fine at ten thousand and unusable at a million, and the
+# box is for reading and nudging a record rather than for holding a long one.
+PASTE_MAX_LINES = 20000
+
 SEQ_LOCAL = "Local waveform"
 SEQ_UNITS = ("ns", "us", "ms", "s")
 _TIME_UNITS = {"s": 1.0, "ms": 1e-3, "m": 1e-3, "us": 1e-6, "u": 1e-6,
@@ -954,14 +959,40 @@ def dac_samples(samples, normalize=True):
     return np.clip(data, -1.0, 1.0)
 
 
-def cache_file(name):
-    return os.path.join(WAVE_CACHE, safe_name(name) + ".npy")
+# The first line of every cached waveform, and how one is told apart from any
+# other CSV that happens to live in the same folder - a two-column scope capture
+# read into a single stream of samples would be time and volts interleaved.
+CACHE_MARK = "BK4063B-AWG-GUI waveform"
+
+
+def cache_file(name, ext=".csv"):
+    return os.path.join(WAVE_CACHE, safe_name(name) + ext)
 
 
 def cache_save(name, samples):
-    """Keep a copy of what was just uploaded, so it can be previewed later."""
+    """Keep a copy of what was just uploaded, so it can be previewed later.
+
+    Text rather than .npy: the point of a local copy is being able to see what
+    was sent, and a binary blob in a folder called Waveforms is not that. Seven
+    significant figures is well past what a 16-bit DAC can hold, so nothing is
+    lost by writing it out in a form that opens in anything.
+    """
     os.makedirs(WAVE_CACHE, exist_ok=True)
-    np.save(cache_file(name), np.asarray(samples, dtype=np.float32))
+    data = np.asarray(samples, dtype=np.float64).ravel()
+    np.savetxt(cache_file(name), data, fmt="%.7g",
+               header=f"{CACHE_MARK} '{name}', {data.size} points, "
+                      "one sample per line, normalised to -1..1")
+
+
+def cache_read(path):
+    """One cached waveform's samples, or None if the file is not one of ours."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            if CACHE_MARK not in fh.readline():
+                return None
+        return np.asarray(np.loadtxt(path, ndmin=1), dtype=np.float64).ravel()
+    except Exception:
+        return None                   # a damaged entry is not worth a crash
 
 
 def cache_load():
@@ -972,22 +1003,67 @@ def cache_load():
     except OSError:
         return out
     for entry in entries:
-        if not entry.endswith(".npy"):
-            continue
-        try:
-            out[entry[:-4]] = np.asarray(np.load(os.path.join(WAVE_CACHE, entry)),
-                                         dtype=np.float64).ravel()
-        except Exception:
-            pass                      # a corrupt cache entry is not worth a crash
+        path = os.path.join(WAVE_CACHE, entry)
+        if entry.endswith(".csv"):
+            data = cache_read(path)
+            if data is not None:
+                out[entry[:-4]] = data
+        elif entry.endswith(".npy") and entry[:-4] not in out:
+            try:
+                out[entry[:-4]] = np.asarray(np.load(path),
+                                             dtype=np.float64).ravel()
+            except Exception:
+                pass
     return out
 
 
-def cache_forget(name):
+def cache_migrate():
+    """Rewrite any .npy left from before as the CSV this app now keeps.
+
+    The original is left where it is rather than deleted - it is somebody's
+    file, and the CSV beside it holds the same numbers to more precision than
+    the generator can use.
+    """
+    done = []
     try:
-        os.remove(cache_file(name))
-        return True
+        entries = sorted(os.listdir(WAVE_CACHE))
     except OSError:
-        return False
+        return done
+    for entry in entries:
+        name = entry[:-4]
+        if not entry.endswith(".npy") or os.path.exists(cache_file(name)):
+            continue
+        try:
+            cache_save(name, np.asarray(np.load(os.path.join(WAVE_CACHE, entry)),
+                                        dtype=np.float64).ravel())
+            done.append(name)
+        except Exception:
+            pass
+    return done
+
+
+def cache_forget(name):
+    """Delete this app's copies of a waveform, and only this app's.
+
+    The CSV is checked for the header before it goes. Cache files and files
+    that merely share the folder are now both CSVs, and the worked example is
+    a tracked project file - Forget must not be able to take it out because
+    something on the generator happens to have the same name.
+    """
+    gone = False
+    csv = cache_file(name)
+    if cache_read(csv) is not None:
+        try:
+            os.remove(csv)
+            gone = True
+        except OSError:
+            pass
+    try:
+        os.remove(cache_file(name, ".npy"))
+        gone = True
+    except OSError:
+        pass
+    return gone
 
 
 def safe_name(text):
@@ -1158,8 +1234,9 @@ def preview_period(wvtp, vals, mode="Off", mod=None, arb_period=None):
     if mode == "Sweep":
         return max(mnum("TIME", 1.0), 1e-9)
     if mode == "Burst":
-        period = mnum("PRD", 0.0)
-        return period if period > 0 else carrier * max(mnum("TIME", 1.0), 1.0)
+        # Never shorter than the burst: the generator lengthens a period that
+        # cannot hold the cycles asked for rather than running them together.
+        return max(mnum("PRD", 0.0), carrier * max(mnum("TIME", 1.0), 1.0))
     if mode in ("AM", "DSBAM", "FM", "PM", "PWM"):
         rate = mnum("FRQ", 0.0)
         return 1.0 / rate if rate > 0 else carrier
@@ -1267,7 +1344,12 @@ def preview_points(span, wvtp, vals, mode="Off", mod=None, arb=None,
     # missing from the zero rather than as a square edge.
     edges = _key_rate(mode, mod) * span
     if 1.0 <= edges <= n:
-        n = int(round(round((n - 1) / edges) * edges)) + 1
+        # Rounded down, never up. Rounding to the nearest could land past the
+        # ceiling, and clamping afterwards threw the alignment away again -
+        # which left two bursts of one record sampled at different points
+        # within it, and differing by a good fraction of an edge.
+        whole = max(1, int((n - 1) // edges))
+        n = int(round(whole * edges)) + 1
     return max(2, min(n, PREVIEW_MAX_POINTS))
 
 
@@ -1284,6 +1366,25 @@ def preview_aliasing(span, n, wvtp, vals, mode="Off", mod=None, arb=None,
     return any(rate > 0 and n / (span * rate) < DENSITY_LIMITS.get(unit, 8.0)
                for rate, unit, _
                in preview_features(wvtp, vals, mode, mod, arb, arb_period))
+
+
+def idle_volts(wvtp, vals, phase_deg, arb=None, hold=True, invert=False):
+    """The volts the carrier sits at when it is parked at `phase_deg`.
+
+    What a burst rests at between bursts. Evaluated at the phase itself rather
+    than read off the first sample of a drawn trace: that trace starts one
+    sample in, which put a sine that rests at 0 V at 8 mV.
+    """
+    num = _numget(vals)
+    ofst = num("OFST")
+    if wvtp in ("DC", "NOISE"):
+        return ofst
+    freq = num("FRQ", 1000.0) or 1000.0
+    y = _shape(wvtp, np.full(1, phase_deg / 360.0), num, 1.0 / freq, arb, hold)
+    if y is None:
+        return None
+    value = -float(y[0]) if invert else float(y[0])
+    return ofst + num("AMP", 1.0) / 2.0 * value
 
 
 def preview_curve(wvtp, vals, arb=None, periods=2.0, n=None, hold=True,
@@ -1343,6 +1444,8 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=None, hold=True,
     ph_off = np.full(n, num("PHSE") / 360.0)     # cycles
     scale = np.ones(n)                           # amplitude multiplier
     duty_over = None
+    bursting = None                              # None unless an N-cycle burst
+    burst_phase = rest_phase = None
     note = ""
 
     if mode in ("AM", "DSBAM"):
@@ -1390,10 +1493,28 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=None, hold=True,
             # Gated burst follows an external signal we know nothing about.
             note = "gated burst: gate not modelled"
         else:
-            cycles = max(mnum("TIME", 1.0), 0.0)
-            prd = mnum("PRD", 0.0) or (cycles / freq)
-            scale = np.where(np.mod(t - mnum("DLAY", 0.0), max(prd, 1e-12))
-                             < cycles / freq, 1.0, 0.0)
+            length = max(mnum("TIME", 1.0), 1.0) / freq
+            trigger = str(mod.get("TRSR", "INT")).strip().upper()
+            if trigger == "INT":
+                repeat = max(mnum("PRD", 0.0), length)
+            else:
+                # When the next trigger arrives is not ours to know, so one
+                # burst is drawn and the window rests after it.
+                repeat = span + length
+                note = f"{trigger} trigger: one burst shown"
+            since = np.mod(t - mnum("DLAY", 0.0), max(repeat, 1e-12))
+            bursting = since < length
+            # Every burst restarts its carrier at the start phase. It is not a
+            # gate over a carrier that has been free-running underneath, which
+            # is what this drew: with a burst period that is not a whole number
+            # of carrier cycles - 10 ms of a 4 ms record - the second burst
+            # came out beginning halfway through the record.
+            #
+            # Between bursts the phase simply stays at the start phase, which
+            # is also the level the output rests at. One expression covers
+            # both, so the two cannot disagree.
+            rest_phase = ph_off + mnum("STPS", 0.0) / 360.0
+            burst_phase = rest_phase + since * freq
 
     if wvtp == "DC":
         return t, np.full(n, ofst), note
@@ -1405,10 +1526,13 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=None, hold=True,
     # One phase accumulator for the lot: a plain carrier is the constant case,
     # and FM, FSK and a sweep are the same integral with f varying.
     ph = np.cumsum(f_inst) * dt + ph_off
+    if bursting is not None:
+        ph = np.where(bursting, burst_phase, rest_phase)
     y = _shape(wvtp, ph, num, period, arb, hold, duty_over=duty_over)
     if y is None:
         return None
-    y = y * scale
+    if bursting is None:
+        y = y * scale
     if invert:
         y = -y                                   # polarity flips the AC part only
     return t, ofst + (amp / 2.0) * y, note
@@ -1655,7 +1779,12 @@ class App:
         self.arb_table = None         # every column of that file, for the picker
         self.arb_element = None       # the last built/loaded/pasted waveform,
                                       # kept so a train is never built on a train
+        migrated = cache_migrate()        # anything still kept as .npy
         self.known_waves = cache_load()   # name -> samples, from earlier sessions
+        if migrated:
+            self.log(f"Rewrote {len(migrated)} local copy(ies) as CSV: "
+                     + ", ".join(migrated)
+                     + ". The .npy originals are still there and can go.")
         self.device_waves = []        # what the generator last said it holds
         self.arb_source = ""
         self.read_stamp = ""
@@ -1918,7 +2047,17 @@ class App:
             self.widgets[key] = cb
             self.inst_vals[key] = ""
             self.natural[key] = "normal"
-            var.trace_add("write", lambda *_, k=key: self.on_edit(k, None))
+            var.trace_add("write",
+                          lambda *_, k=key, c=ch: self.on_edit(
+                              k, lambda: self.show_burst_idle(c)))
+
+        # Under the mode row because that is where a burst is chosen, and the
+        # level a burst rests at is a property of the burst rather than of the
+        # waveform.
+        note = ttk.Label(m, text="", justify="left")
+        note.grid(row=(MODE_SLOTS + 2) // 3 + 1, column=0, columnspan=6,
+                  sticky="w", padx=(0, 4), pady=(3, 0))
+        setattr(self, f"modnote{ch}", note)
 
     @staticmethod
     def _grid(parent):
@@ -2151,15 +2290,31 @@ class App:
                         shape.split("(")[0].strip().replace(" ", "_").lower())
 
     def do_paste(self):
-        """Type or paste numbers straight in, instead of loading a file."""
+        """The pending record's numbers, to read, scroll and edit by hand.
+
+        Opens holding whatever is pending rather than empty, which makes it the
+        way to look at a waveform point by point and change one - the thing
+        that was otherwise impossible once a record existed. Type into an empty
+        box and it is what it always was.
+        """
+        pending = self.arb_samples
         dlg = tk.Toplevel(self.root)
         dlg.title("Type or paste values")
         dlg.transient(self.root)
         dlg.grab_set()
+
+        note = ""
+        if pending is not None and pending.size > PASTE_MAX_LINES:
+            note = (f"\n\n{pending.size:,} points is too many to put in a text "
+                    f"box, so this one is empty. Anything typed here replaces "
+                    f"the lot.")
+        elif pending is not None:
+            note = (f"\n\nShowing the {pending.size:,} pending point(s). Edit "
+                    f"and press Use, or Clear and start again.")
         ttk.Label(dlg, justify="left", text=(
             "One sample per line, a single row of numbers, or columns separated\n"
             "by commas, semicolons or spaces. A non-numeric first line is read\n"
-            "as column names. Blank lines and # comments are skipped.")
+            "as column names. Blank lines and # comments are skipped." + note)
         ).pack(anchor="w", padx=8, pady=(8, 4))
 
         box = ttk.Frame(dlg)
@@ -2169,6 +2324,8 @@ class App:
         txt.configure(yscrollcommand=bar.set)
         txt.pack(side="left", fill="both", expand=True)
         bar.pack(side="left", fill="y")
+        if pending is not None and pending.size <= PASTE_MAX_LINES:
+            txt.insert("1.0", "\n".join(f"{v:.7g}" for v in pending) + "\n")
 
         row = ttk.Frame(dlg)
         row.pack(fill="x", padx=8, pady=8)
@@ -2183,7 +2340,10 @@ class App:
             self.take_table(table, names, "pasted values", "pasted")
 
         ttk.Button(row, text="Use these values", command=use).pack(side="left")
-        ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
+        ttk.Button(row, text="Clear",
+                   command=lambda: txt.delete("1.0", "end")).pack(side="left",
+                                                                  padx=6)
+        ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="left")
         txt.focus_set()
 
     # -- sequence editor ---------------------------------------------------
@@ -2612,7 +2772,7 @@ class App:
         self.mem_btn.pack(side="left")
         ttk.Button(row, text="Forget local copy",
                    command=self.do_forget).pack(side="left", padx=6)
-        ttk.Button(row, text="Use on channel",
+        ttk.Button(row, text="Load to pending",
                    command=self.do_use_wave).pack(side="left")
 
         box = ttk.Frame(f)
@@ -2668,19 +2828,28 @@ class App:
         self.draw_preview()
 
     def do_use_wave(self):
-        """Put the selected waveform into the channel chosen in the upload row."""
+        """Load the selected waveform's local copy into the pending slot.
+
+        It used to put the name straight onto a channel, which meant choosing a
+        waveform without having seen it - and the Arb wave dropdown in the
+        channel row already does that. Pending draws it on the preview first,
+        and puts its numbers where Type/paste can show them.
+        """
         name = self.selected_wave()
         if not name:
             self.log("Pick a waveform in the list first.")
             return
-        if name not in self.device_waves:
-            self.log(f"'{name}' is not in the generator's memory - upload it first.")
+        samples = self.known_waves.get(name)
+        if samples is None:
+            self.log(f"No local copy of '{name}'. The generator holds it, but "
+                     "it will not read samples back over USB, so there is "
+                     "nothing here to load.")
             return
-        ch = int(self.arb_ch.get())
-        self.vars[f"C{ch}:BSWV:WVTP"].set("ARB")
-        self.vars[f"C{ch}:ARWV:NAME"].set(name)
-        self.show_ch[ch].set(True)
-        self.log(f"CH{ch} set to '{name}' - press Apply changes to send it")
+        samples = np.asarray(samples, dtype=np.float64).ravel()
+        self.take_table(samples.reshape(-1, 1), None,
+                        f"local copy of {name}", name)
+        self.log(f"'{name}' loaded to pending, {samples.size} pts. "
+                 "Nothing was sent to the generator.")
 
     def do_setups(self):
         """Saving and recalling a whole instrument state, in its own window.
@@ -2827,6 +2996,11 @@ class App:
                 self.driver[group] = key
             if key.startswith("C") and ":BSWV:" in key:
                 self.recompute(int(key[1]))
+        if key.startswith("C") and key[1:2].isdigit():
+            # The resting level moves with the arb name, the amplitude, the
+            # offset and the polarity as much as with the mode row, so it is
+            # worked out again for anything on the channel.
+            self.show_burst_idle(int(key[1]))
         self.refresh_marks()
         self.draw_preview()
 
@@ -3040,6 +3214,7 @@ class App:
                 foreground="#000" if on else "#aaa")
 
         self.check_pwm(ch)
+        self.show_burst_idle(ch)
         if not self.loading:
             # A different wave type is a different set of pairs - a pulse gains
             # a duty, DC loses its period - so the derived cells are worked out
@@ -3077,6 +3252,7 @@ class App:
             else:
                 lab.configure(text="")
                 w.configure(values=(), state="disabled")
+        self.show_burst_idle(ch)
         self.check_pwm(ch)
 
     def remap_mode_slots(self, ch, old, new):
@@ -3148,6 +3324,53 @@ class App:
             messagebox.showerror(title, message)
             self.log(f"CH{ch}: {message.splitlines()[0]}")
         self.pwm_bad[ch] = problem
+
+    def burst_idle(self, ch):
+        """What the output will sit at between bursts, in volts, or None.
+
+        Not a quirk of this panel - it is what the generator does. Between
+        bursts it holds the carrier at the burst start phase, and the manual
+        defines start phase 0 on an arbitrary waveform as the first stored
+        sample. So a record that begins high leaves the output high until
+        something triggers it, which is worth knowing before that output is
+        wired into anything that would rather not be held on.
+        """
+        if self.vars[f"C{ch}:MODE"].get().strip() != "Burst":
+            return None
+        mode, mod = self.channel_mode(ch)
+        if str(mod.get("GATE_NCYC", "NCYC")).strip().upper() != "NCYC":
+            return None               # a gated burst follows a signal we cannot see
+        wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
+        vals = {key: self.vars[f"C{ch}:BSWV:{key}"].get().strip()
+                for key, _, _ in WAVE_PARAMS}
+        name = self.vars[f"C{ch}:ARWV:NAME"].get().strip()
+        return idle_volts(
+            wvtp, vals,
+            _as_float(vals.get("PHSE"), 0.0) + _as_float(mod.get("STPS"), 0.0),
+            arb=self.known_waves.get(name) if wvtp == "ARB" else None,
+            hold=self.arb_style(ch)[0] == "steps-post",
+            invert=self.vars[f"C{ch}:OUTP:PLRT"].get().strip() == "INVT")
+
+    def show_burst_idle(self, ch):
+        """Put that level under the mode row, or clear the line."""
+        label = getattr(self, f"modnote{ch}", None)
+        if label is None:
+            return
+        volts = self.burst_idle(ch)
+        if volts is None:
+            label.configure(text="")
+            return
+        amp = _as_float(self.vars[f"C{ch}:BSWV:AMP"].get().strip(), 0.0)
+        # A tenth of a percent of the swing is the DAC's own noise floor, not a
+        # level anything downstream will notice.
+        if abs(volts) <= max(abs(amp) * 0.001, 1e-4):
+            label.configure(text=f"Between bursts the output rests at "
+                                 f"{volts:+.3g} V.", foreground="#666")
+        else:
+            label.configure(
+                text=f"Between bursts the output RESTS AT {volts:+.3g} V, not "
+                     f"0 V - it holds there until triggered.",
+                foreground="#c60")
 
     def mode_key(self, ch, slot):
         """SCPI key the given mode slot currently stands for, or None."""

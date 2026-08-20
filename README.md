@@ -229,6 +229,16 @@ blank lines and `#` comments are skipped, and multi-column input gets the same
 column picker as a file. Ragged rows are rejected rather than silently
 misaligned.
 
+**It opens holding whatever is pending**, one sample per line, which makes it
+the way to read a record point by point and change one — otherwise the only
+thing you could do to an existing waveform was replace it whole. Edit and press
+**Use these values**, or press **Clear** and start from an empty box. Above
+20,000 points it opens empty and says so: a text widget with a line per sample
+is fine at ten thousand and unusable at a million.
+
+Pair it with **Load to pending** in the generator's waveform list to pull a
+waveform this app has a copy of into the box and edit it.
+
 ## Sequences
 
 Where a train repeats one element, a **sequence** lays down segments that need
@@ -413,15 +423,13 @@ in one go.
 
 ### A worked example
 
-`Waveforms/` holds one, with the script that made it:
-
-```
-python Waveforms/make_blackman_burst.py
-```
-
 10 ms of 100 kHz carrier under a Blackman envelope - 1000 carrier cycles,
 50,000 points at 50 samples per cycle, the window tapering to zero at both ends
 so the record joins onto itself when it repeats.
+
+It used to ship with a script that generated it, because there was no other way
+to ask for such a thing. The panel now builds it directly: **Blackman-Harris**,
+**Using real units with 5e6 Sa/s**, length `10m`, carrier `100e3`.
 
 ![Blackman-windowed 100 kHz burst](Waveforms/blackman_100kHz_10ms.png)
 
@@ -542,7 +550,7 @@ Everything on the channel panel reaches the trace:
 | Shape detail | duty, symmetry, pulse width, **rise, fall, delay** |
 | Modulation | AM, DSBAM, FM, PM, PWM, ASK, FSK, PSK |
 | Sweep | time, start, stop, linear/log, direction |
-| Burst | period, cycle count, delay (N-cycle) |
+| Burst | period, cycle count, delay, start phase (N-cycle), **including the level it rests at between bursts** |
 | Arb | the local copy, held or interpolated per the clock |
 
 ![Parameters the preview now honours](Waveforms/preview_modes.png)
@@ -679,8 +687,12 @@ no effect. Waveforms come off at the front panel, Utility > Store/Recall.
 Re-uploading a name overwrites it, so reusing names keeps the list from growing.
 
 **Forget local copy** deletes only this app's copy of the samples; the waveform
-stays on the generator. **Use on channel** stages the selected waveform on the
-channel named in the upload row — it does not send anything until you Apply.
+stays on the generator. **Load to pending** puts the selected waveform's local
+copy into the pending slot, where the preview draws it and
+[Type/paste values...](#typing-or-pasting-values) shows its numbers — so you can
+see what a stored waveform is before doing anything with it, and edit it if you
+want. It sends nothing. To put an already-stored waveform onto a channel, use
+the **Arb wave** dropdown in that channel's row.
 
 ### Why a local copy is needed at all
 
@@ -688,18 +700,38 @@ The generator will not read a stored waveform back out over USB: `WVDT?` times
 out and wedges the session. So a waveform uploaded in an earlier session is a
 name and nothing else, and cannot be drawn.
 
-Every upload therefore saves a copy into `Waveforms/` as `.npy`, and those are
-loaded at startup, which is what lets the preview draw a waveform you uploaded
-days ago. What is stored is the normalised samples, i.e. what the DAC actually
-received, not the raw file.
+Every upload therefore saves a copy into `Waveforms/` as a **CSV**, and those
+are loaded at startup, which is what lets the preview draw a waveform you
+uploaded days ago. What is stored is the normalised samples — what the DAC
+actually received, not the raw file — one per line, to seven significant
+figures, which is well past what a 16-bit DAC can hold:
 
-The folder works in both directions: any `.npy` in it is offered as a local copy
-under its filename, so dropping one in named to match a waveform already on the
-generator makes that waveform previewable without re-uploading it. Waveforms
+```
+# BK4063B-AWG-GUI waveform 'pasted', 4 points, one sample per line, normalised to -1..1
+0.5
+1
+0.5
+0
+```
+
+Text rather than `.npy`, because the point of a local copy is being able to see
+what was sent, and a binary blob in a folder called `Waveforms` is not that. It
+costs about 10 bytes a point against 4, so a megapoint record is a 10 MB file.
+
+That header line is also how a cached waveform is told from any other CSV that
+happens to live in the folder — a two-column scope capture read as a single
+stream of samples would be time and volts interleaved. **Files without it are
+ignored**, so `Waveforms/` can hold both.
+
+The folder works in both directions: any cache CSV in it is offered as a local
+copy under its filename, so dropping one in named to match a waveform already on
+the generator makes that waveform previewable without re-uploading it. Waveforms
 that predate this app show as `no local copy` until you do one or the other.
 
-Only `.csv` and `.png` in `Waveforms/` are tracked by git; uploaded `.npy` copies
-are bench artefacts and stay out, the same way captured data does.
+`.npy` copies from before this change are still read, and are rewritten as CSV
+at startup with the original left in place — the log says which. Only `.csv` and
+`.png` in `Waveforms/` are tracked by git; uploaded copies are bench artefacts
+and stay out, the same way captured data does.
 
 **Deleting** an uploaded waveform has to be done at the front panel
 (Utility -> Store/Recall) - the firmware exposes no SCPI for it.
@@ -725,6 +757,58 @@ The carrier also constrains what is legal: PWM needs a PULSE carrier, and the re
 need SINE/SQUARE/RAMP/ARB. Ask for AM on a pulse carrier and you quietly get PWM.
 The PWM half of that is checked in the panel - see [The panel](#the-panel) - since
 the generator will not raise it for you.
+
+### A burst rests somewhere, and it may not be zero
+
+**Between bursts the output is not off.** The generator parks at the carrier's
+value at the burst **start phase**, and holds it until the next trigger. The
+manual is explicit about what that means for an arbitrary waveform: *"Define the
+start point in a waveform... For an Arbitrary Waveform, 0° is the first waveform
+point."* So with the default 0° start phase, **the resting level is your
+record's first sample**:
+
+```
+rest volts = Offset + (Ampl/2) x first sample
+```
+
+A record that begins at full scale therefore leaves the output at full scale,
+indefinitely, before it has ever been triggered — which matters a great deal if
+that output is wired into something that would rather not be held on.
+
+It is not only arbs. At start phase 0° a **square** rests at its high level and
+a **ramp** rests at its bottom; a sine rests at the offset, which is the case
+that made the default look harmless.
+
+The panel says so, under the mode row, whenever a channel is set to an N-cycle
+burst:
+
+```
+Between bursts the output rests at +0 V.
+Between bursts the output RESTS AT +2.5 V, not 0 V - it holds there until triggered.
+```
+
+The second is in orange. Nothing is prevented — a burst that rests high is a
+perfectly legitimate thing to want — but it is stated before you wire it up.
+The preview draws the same level, so the picture and the line agree.
+
+Three ways to move it, if it is not where you want it:
+
+- **Start the record at the level you want.** Most built shapes already do:
+  Hann, Tukey, Square, Trapezoid, Sinc, Chirp and Multitone start at exactly 0,
+  Blackman-Harris at 6x10⁻⁵ of full scale. The exceptions are the ramps and the
+  hold — `Exponential ramp` starts at 1 by default, and `Linear`/`Smoothstep`
+  *end* at 1.
+- **Put a zero at the front.** In the [sequence](#sequences) builder a
+  `Hold (DC)` row with `level=0` as the first segment costs a few points and
+  puts the rest level where you want it.
+- **Use Start phase.** 0–360° maps across the whole record, so 180° starts
+  halfway. Useful when the waveform already passes through the level you want.
+
+**Delay does not help.** It is the time between the trigger and the start of the
+burst, and the output sits at the same resting level throughout it.
+
+A gated burst makes no such claim — it follows a signal this app cannot see, so
+the line stays blank.
 
 ### Sweep and burst need the DDS clock
 

@@ -11,7 +11,9 @@ __pycache__/
 .venv/
 venv/
 
-# ...except the example waveforms, which are part of the project. The .txt and
-# .npy copies stay out: they are the same samples in another wrapper and the
-# generator script remakes them.
-!Waveforms/*.csv
+# ...except the worked example, which is part of the project. Named rather than
+# globbed: uploaded waveforms are now cached as CSV too, and those are bench
+# artefacts - a megapoint record is a 10 MB file with no business in git. The
+# .txt and .npy copies of the example stay out as well, being the same samples
+# in another wrapper that the generator script remakes.
+!Waveforms/blackman_100kHz_10ms.csv
