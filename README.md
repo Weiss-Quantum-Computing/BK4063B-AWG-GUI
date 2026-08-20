@@ -74,13 +74,28 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
 
   | Wave type | The pair | Leads until you say otherwise |
   |---|---|---|
+  | anything oscillating | `Freq (Hz)` and `Period (s)` — reciprocals | `Freq (Hz)`, which is what the rest of the panel is written in |
+  | anything oscillating | `Ampl (Vpp)` + `Offset (V)` against `High (V)` + `Low (V)`, since `high = offset + ampl/2` | `Ampl`/`Offset`, being what an output is specified in |
   | `ARB` on the **TrueArb** clock | `Sa/s` and `Freq (Hz)`, since `freq = Sa/s / points` and the point count belongs to the waveform | `Sa/s`, being what the record is actually clocked by |
   | `PULSE` | `Width (s)` and `Duty (%)`, since `width = duty / 100 / freq` | `Width (s)`, being the absolute one |
 
-  Neither pair is tinted where it is not real: under **DDS** the record is one
-  period whatever its length, so the frequency genuinely is a setting, and a
-  `SQUARE` has a duty but no width to pair it with. See [Why the frequency moves
-  when you change waveform](#why-the-frequency-moves-when-you-change-waveform).
+  **The panel does the arithmetic.** Type an amplitude and the high and low
+  levels follow; type a high level and the amplitude and offset follow. Changes
+  chain: a new frequency moves the period, and moves the duty that an unchanged
+  width now implies. The one pair it will not compute is the sample rate against
+  the frequency, which needs the record's point count — that lives on the
+  generator, not in the panel, so the cell is tinted without being filled in.
+
+  **A derived cell is never sent.** It carries no `*`, and Apply leaves it out:
+  putting both descriptions of one setting into a single command is two
+  instructions, and the last one wins. Type into the tinted half and the two
+  swap places in the command as well as on screen.
+
+  No pair is tinted where it is not real: under **DDS** the record is one period
+  whatever its length, so the frequency genuinely is a setting; a `SQUARE` has a
+  duty but no width to pair it with; and `DC` has no frequency to have a period.
+  See [Why the frequency moves when you change
+  waveform](#why-the-frequency-moves-when-you-change-waveform).
 
   The second is a value this app worked out, which is what the
   [sequence](#sequences) builder does when it puts the clock a timed record
@@ -131,8 +146,8 @@ press **Build**. The result becomes the pending waveform, the preview switches t
 | Shape | Parameters | What it is for |
 |-------|-----------|----------------|
 | Gaussian | truncation in σ | The default pulse. σ=3 puts the ends at 1%, so there is no step to ring. |
-| Blackman | – | Lowest spectral sidelobes of the windows here; the usual choice for Raman and Rabi pulses where off-resonant excitation matters. |
-| Hann | – | Gentler than Blackman, wider main lobe. |
+| Blackman-Harris | – | The four-term window: sidelobes near **−92 dB** against the classic three-term Blackman's −58, which is what matters when the sidelobes are what would drive the line you are trying not to drive. The usual choice for Raman and Rabi pulses. |
+| Hann | – | Gentler, wider main lobe, −31 dB sidelobes. |
 | Tukey flat-top | flat fraction | Flat top with cosine shoulders. `flat=0` is a Hann, `flat=1` a square. |
 | Sech (ARP) | truncation | The adiabatic-rapid-passage amplitude profile, and the analytically solvable Rosen–Zener case. Pair with **Chirp**. |
 | Sinc | zero crossings | A rectangle in frequency — the start of a flat-topped spectral profile. |
@@ -148,8 +163,47 @@ press **Build**. The result becomes the pending waveform, the preview switches t
 
 **Carrier cycles** turns any envelope into a burst: the shape becomes the outline
 and a sine at that many cycles per record fills it. Leave it `0` for a bare
-envelope. This is how the Blackman example above is specified — Blackman shape,
-1000 carrier cycles.
+envelope. This is how the Blackman example above is specified — Blackman-Harris
+shape, 1000 carrier cycles.
+
+### Real units
+
+Cycles and points, rather than hertz and seconds, because a record has no
+duration until a clock is picked — described that way it survives being replayed
+at any rate. But nobody thinks in cycles at the bench, so **Using real units
+with ___ Sa/s** names a clock and switches both boxes over:
+
+| | Points | Real units |
+|---|---|---|
+| length | **Points** — how many samples | **Length** — how long, in the unit beside it (`2u`, `200m`, `1.5s` override it) |
+| carrier | **Carrier cycles** — per record | **Carrier (Hz)** |
+
+Switching converts rather than clears, so what was right a moment ago still is:
+10,000 points at 1 MSa/s becomes 10 ms, and 50 cycles across it becomes 5 kHz.
+Note what changing **Length** then means — at a fixed clock a longer record is a
+*longer pulse*, not a finer one. That is the honest reading, and it is why the
+box is a time rather than a point count once a clock is named.
+
+The rate is used for the conversion and the note, nothing else. It is not sent
+anywhere and it is not the channel's clock: set the channel to TrueArb at the
+same rate, or build a [sequence](#sequences), if you want the record to actually
+play at it.
+
+The note says what the record comes to and what it cannot resolve:
+
+```
+10,000 pts = 10 ms, repeats at 100 Hz
+10,000 pts = 10 ms, repeats at 100 Hz | 3000 carrier cycles across 10,000
+points is 3.3 points each - the carrier is only just resolved, so the peaks
+will read low and the shape will be visibly stepped
+```
+
+It turns orange when something will not survive the point count: a carrier under
+two points per cycle is **aliased** and comes out as a different tone entirely,
+one above the Nyquist limit of the stated rate likewise, and a rise, fall, edge
+or flat fraction that works out to fewer than eight points is too thin to shape.
+The full text goes to the log on every Build as well, since the line is replaced
+by whatever is built next.
 
 Envelopes come out unipolar (0…1) because that is what an intensity control
 wants; anything oscillating comes out bipolar (−1…+1). A unipolar shape therefore
@@ -165,48 +219,10 @@ blank lines and `#` comments are skipped, and multi-column input gets the same
 column picker as a file. Ragged rows are rejected rather than silently
 misaligned.
 
-## Pulse trains
-
-**Pulse train** repeats whatever is pending - a built shape, a loaded file or
-pasted values - into one record holding the whole train, then Upload sends it as
-a single arb.
-
-![Uniform, amplitude-scanned and unequally spaced trains](Waveforms/pulse_trains.png)
-
-| Field | Meaning |
-|-------|---------|
-| Pulses | how many copies |
-| Period (x pulse) | pulse start to pulse start, in multiples of the element's own length. `1` is back to back; `3` gives a gap twice the pulse |
-| Lead-in (x pulse) | dead time before the first pulse |
-| Baseline | the level held between pulses |
-| Per-pulse amplitude | optional comma list of scale factors, cycled |
-| Gaps (x pulse) | optional comma list of gaps, cycled, overriding Period |
-
-Spacings are in **multiples of the element's length**, not seconds, because the
-element has no duration until a sample clock is chosen. Specified this way a
-train keeps its shape at any playback rate, and the panel shows what it comes to
-in milliseconds on the channel it is aimed at. Period is clamped at `1`: a
-shorter one would need pulses to overlap and sum, which is a different operation
-from repeating.
-
-The trailing gap is part of the record, so the arb loops into itself with the
-spacing intact instead of butting the last pulse against the first.
-
-Two fields earn their keep on an AMO bench:
-
-- **Per-pulse amplitude** puts a pulse-area scan in a single record - `1, 0.7,
-  0.4` gives three pulses at descending area, no reprogramming between shots.
-- **Gaps** makes an unequally spaced sequence. Two pulses with `Gaps` set to the
-  free-evolution time is a Ramsey sequence; a list cycles for anything longer.
-
-**Make train** always rebuilds from the last thing you built, loaded or pasted,
-never from the previous train - so changing the count and pressing again does
-what you meant rather than squaring the record.
-
 ## Sequences
 
 Where a train repeats one element, a **sequence** lays down segments that need
-not resemble each other: a Blackman at 5 MHz, a gap, the same envelope at half
+not resemble each other: a Blackman-Harris at 5 MHz, a gap, the same envelope at half
 the amplitude and ninety degrees, a slow ramp, a hold, a ramp back down. Each
 segment carries its own shape, duration, amplitude, carrier frequency and phase,
 and its own gap to whatever follows. The whole thing becomes one arb record and
@@ -225,7 +241,7 @@ the sequence against the picture.
 | Carrier (Hz) | a carrier filling the segment. `0` for none |
 | Phase (deg) | the phase that carrier starts at |
 | Gap after | dead time before the next segment, held at the baseline |
-| Extra | the shape's own parameters as `key=value` - `start=0 end=1`, `level=1`, `trunc=4`, `name=<waveform>` |
+| Extra | the shape's own parameters as `key=value`. **Picking a shape fills in its defaults**, so the row says what that shape will accept - `trunc=3` for a Gaussian, `flat=0.5` for a Tukey, `start=1 end=0 tau=0.3` for an exponential ramp. These are exactly the boxes the builder gives each shape. |
 
 `^ v` move a segment, `D` duplicates it, `X` deletes it. The running total under
 the list says how many segments, how long, and how many points.
@@ -275,7 +291,11 @@ where a carrier's endpoints are merely where the window fell.
   it is a rectangular-envelope burst instead.
 - **Local waveform** takes any waveform this app holds a copy of - `name=<what
   it is called>` in Extra - and stretches it into whatever time the segment is
-  given, so one stored record can appear twice at two different lengths.
+  given, so one stored record can appear twice at two different lengths. The
+  name **`pending`** reaches whatever was last built, loaded or pasted, even
+  though it has never been uploaded: a run of rows all naming `pending` is a
+  train of identical pulses, with the gaps and per-pulse amplitudes as columns.
+  Name a segment wrongly and the error lists everything that is reachable.
 
 ### Keeping a sequence
 
@@ -292,9 +312,9 @@ come out of a script:
 # clock: on
 #
 # shape, time, ampl, freq, phase, gap, extra
-Blackman, 2, 1, 5e6, 0, 10
-Blackman, 2, 0.5, 5e6, 90, 10
-Blackman, 4, 1, 4.8e6, 0, 0
+Blackman-Harris, 2, 1, 5e6, 0, 10
+Blackman-Harris, 2, 0.5, 5e6, 90, 10
+Blackman-Harris, 4, 1, 4.8e6, 0, 0
 ```
 
 The `# rate:` block carries the settings above the list, and pasting restores
@@ -309,17 +329,26 @@ comes back `1e8` rather than `100000000`.
 
 Everything after the sixth comma is the Extra field, so a value with commas of
 its own - `tones=10,20,35` - survives. Blank lines and `#` comments are skipped,
-as everywhere else numbers are pasted in.
+as everywhere else numbers are pasted in. A shape named `Blackman` still reads,
+and resolves to `Blackman-Harris` - the window changed, the file should not have
+to.
 
-The result lands as the pending waveform like anything else built here, which
-means it also becomes the element the **Pulse train** repeats - so a sequence can
-itself be repeated into a longer record.
+The result lands as the pending waveform like anything else built here. A
+sequence never becomes its own source, though: `name=pending` in a rebuilt
+sequence still means whatever was last built, loaded or pasted, so pressing
+**Build** twice does not fold the last result into the next one.
 
 ## Uploading an arbitrary waveform
 
 **Load file...**, pick the column if you are asked, set a name and a channel, then
 **Upload**. The waveform goes into the generator's user memory and is selected on
 that channel.
+
+**Clear pending** throws the waiting waveform away. Nothing on the generator is
+touched — this is the panel forgetting, not the instrument. It is there because
+the pending record is otherwise only ever replaced, never let go: build
+something by mistake and it sits on the preview until it is overwritten, one
+wrong press of **Upload** away from a channel.
 
 ### What the file should look like
 

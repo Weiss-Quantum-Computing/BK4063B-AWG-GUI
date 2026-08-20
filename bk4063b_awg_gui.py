@@ -98,10 +98,19 @@ KEY_OWNERS = {
 # BSWV parameters: (key, label, wave types it applies to). The panel shows them
 # all and greys out the ones the selected type has no use for, so the layout
 # does not jump around when the type changes.
+# Laid out three to a row, so the first two rows are the same three settings
+# twice: frequency, amplitude and offset across the top, and underneath each
+# one the other way of saying it - period, high level, low level. The generator
+# offers all six on its own display, and which row you would rather type
+# depends on what you are setting up.
+OSCILLATING = {"SINE", "SQUARE", "RAMP", "PULSE", "ARB"}
 WAVE_PARAMS = [
-    ("FRQ",   "Freq (Hz)",    {"SINE", "SQUARE", "RAMP", "PULSE", "ARB"}),
-    ("AMP",   "Ampl (Vpp)",   {"SINE", "SQUARE", "RAMP", "PULSE", "ARB"}),
-    ("OFST",  "Offset (V)",   {"SINE", "SQUARE", "RAMP", "PULSE", "ARB", "DC"}),
+    ("FRQ",   "Freq (Hz)",    OSCILLATING),
+    ("AMP",   "Ampl (Vpp)",   OSCILLATING),
+    ("OFST",  "Offset (V)",   OSCILLATING | {"DC"}),
+    ("PERI",  "Period (s)",   OSCILLATING),
+    ("HLEV",  "High (V)",     OSCILLATING),
+    ("LLEV",  "Low (V)",      OSCILLATING),
     ("PHSE",  "Phase (deg)",  {"SINE", "SQUARE", "RAMP", "ARB"}),
     ("DUTY",  "Duty (%)",     {"SQUARE", "PULSE"}),
     ("SYM",   "Symmetry (%)", {"RAMP"}),
@@ -162,8 +171,11 @@ MODE_VERBS = ("MDWV", "SWWV", "BTWV")
 # Modulation types appear as a bare tag with no value, mid-response.
 _BARE_TAGS = {"AM", "DSBAM", "FM", "PM", "PWM", "ASK", "FSK", "PSK"}
 
-# Readback-only keys: the instrument reports them but rejects them on the way
-# back in, or derives them from something else we are already sending.
+# Keys a recalled setup does not send back. The generator takes PERI, HLEV and
+# LLEV perfectly well - they are documented BSWV parameters and the panel offers
+# them - but they say the same thing as FRQ, AMP and OFST, which a recall is
+# already sending. Two descriptions of one setting in a single command is two
+# instructions, and the last one wins. The rest are genuinely readback-only.
 READ_ONLY_KEYS = {"PERI", "MAX_OUTPUT_AMP", "HLEV", "LLEV", "AMPVRMS",
                   "AMPDBM", "TRMD"}
 
@@ -178,7 +190,7 @@ READ_ONLY_KEYS = {"PERI", "MAX_OUTPUT_AMP", "HLEV", "LLEV", "AMPVRMS",
 # shape, and the volts come from Ampl/Offset on the channel.
 # ---------------------------------------------------------------------------
 
-ENV_CHOICES = ("None", "Blackman", "Gaussian", "Hann", "Tukey")
+ENV_CHOICES = ("None", "Blackman-Harris", "Gaussian", "Hann", "Tukey")
 
 
 class _Params:
@@ -265,8 +277,8 @@ def _tanh_top(n, edge, flat):
 
 
 def _envelope(name, n, trunc=3.0, flat=0.5):
-    if name == "Blackman":
-        return np.blackman(n)
+    if name in ("Blackman-Harris", "Blackman"):
+        return _blackman_harris(n)
     if name == "Gaussian":
         return _gaussian(n, trunc)
     if name == "Hann":
@@ -285,8 +297,20 @@ def _build_gaussian(n, p):
     return _gaussian(n, p.num("trunc", 3.0))
 
 
+def _blackman_harris(n):
+    """The four-term Blackman-Harris window.
+
+    Sidelobes at about -92 dB where the classic three-term Blackman manages
+    -58, which is the whole reason to reach for a window here: the sidelobes
+    are what drives the line you are trying not to drive.
+    """
+    x = 2 * np.pi * _unit(n)
+    return (0.35875 - 0.48829 * np.cos(x) + 0.14128 * np.cos(2 * x)
+            - 0.01168 * np.cos(3 * x))
+
+
 def _build_blackman(n, p):
-    return np.blackman(n)
+    return _blackman_harris(n)
 
 
 def _build_hann(n, p):
@@ -386,7 +410,7 @@ _CARRIER = [("Carrier cycles", "cycles", "0", None),
 BUILD_SHAPES = {
     "Gaussian":        (_build_gaussian,
                         [("Truncate (+/-sigma)", "trunc", "3", None)] + _CARRIER),
-    "Blackman":        (_build_blackman, list(_CARRIER)),
+    "Blackman-Harris": (_build_blackman, list(_CARRIER)),
     "Hann":            (_build_hann, list(_CARRIER)),
     "Tukey flat-top":  (_build_tukey,
                         [("Flat fraction", "flat", "0.5", None)] + _CARRIER),
@@ -416,7 +440,7 @@ BUILD_SHAPES = {
     "Chirp":           (_build_chirp,
                         [("Start cycles", "c0", "10", None),
                          ("End cycles", "c1", "100", None),
-                         ("Envelope", "env", "Blackman", ENV_CHOICES)]),
+                         ("Envelope", "env", "Blackman-Harris", ENV_CHOICES)]),
     "Multitone":       (_build_multitone,
                         [("Cycles (comma list)", "tones", "10, 20, 35", None),
                          ("Envelope", "env", "None", ENV_CHOICES)]),
@@ -447,63 +471,51 @@ def build_waveform(shape, n_points, values):
     return y
 
 
-def parse_floats(text):
-    """A comma, semicolon or space separated list of numbers, or None if empty."""
-    out = []
-    for token in re.split(r"[,;\s]+", str(text or "").strip()):
-        if token:
-            out.append(float(token))
-    return out or None
+def build_warnings(shape, n_points, values, rate=0.0, carrier_hz=None):
+    """Ways a record of `n_points` is too coarse for what is being asked of it.
 
-
-def pulse_train(element, count, period=2.0, lead=0.0, baseline=0.0,
-                amplitudes=None, gaps=None):
-    """Repeat one waveform into a train of `count` copies.
-
-    Spacings are in multiples of the element's own length rather than in
-    seconds, because the element has no duration until a sample clock is chosen
-    - expressed this way the train keeps its shape whatever rate it is played
-    at, and the panel converts to time for display.
-
-    period      pulse start to pulse start, so 1.0 is back to back and 2.0
-                leaves a gap as long as the pulse. Clamped at 1.0: a shorter
-                period would need pulses to overlap and sum, which is a
-                different thing from a train.
-    lead        dead time before the first pulse.
-    baseline    the level held between pulses.
-    amplitudes  optional per-pulse scale factors, cycled if shorter than count.
-                A list like "1, 0.5, 0.25" is a pulse-area scan in one record.
-    gaps        optional per-pulse gaps, cycled, overriding `period`. This is
-                what makes an unequally spaced sequence - two pulses split by a
-                settable free-evolution time, say.
-
-    The trailing gap is part of the record, so the arb loops into itself with
-    the spacing intact instead of running the last pulse into the first.
+    A built record is a list of numbers with no time in it until a clock is
+    picked, so most of this is about the point count alone: how many points
+    each carrier cycle gets, and whether a shape's own detail survives. `rate`
+    only matters where the answer is in hertz - the carrier against Nyquist,
+    and what the record comes to in seconds.
     """
-    element = np.asarray(element, dtype=np.float64).ravel()
-    if element.size < 1:
-        raise ValueError("no waveform to repeat")
-    count = int(count)
-    if count < 1:
-        raise ValueError("need at least one pulse")
+    lines = []
+    n = int(n_points) if n_points else 0
+    if n < 2:
+        return ["a record needs at least 2 points"]
+    p = _Params(values)
 
-    n = element.size
-    lead_n = max(int(round(max(lead, 0.0) * n)), 0)
-    if gaps:
-        gap_n = [max(int(round(g * n)), 0) for g in gaps]
-    else:
-        gap_n = [max(int(round(max(period, 1.0) * n)), n) - n]
+    cycles = p.num("cycles", 0.0)
+    if cycles > 0:
+        per_cycle = n / cycles
+        if per_cycle < ALIAS_LIMIT:
+            lines.append(
+                f"{cycles:g} carrier cycles across {n:,} points is "
+                f"{per_cycle:.2g} points each - below two the carrier is "
+                f"aliased, and what comes out is not the tone you asked for")
+        elif per_cycle < DENSITY_LIMITS["cycle"]:
+            lines.append(
+                f"{cycles:g} carrier cycles across {n:,} points is "
+                f"{per_cycle:.2g} points each - the carrier is only just "
+                f"resolved, so the peaks will read low and the shape will be "
+                f"visibly stepped")
+        if rate > 0 and carrier_hz and carrier_hz > rate / 2.0:
+            lines.append(
+                f"a {_hz(carrier_hz)} carrier is above the Nyquist limit of "
+                f"{_hz(rate / 2.0)} for {_hz(rate)} - it will come out as a "
+                f"lower frequency, not as itself")
 
-    pieces = []
-    if lead_n:
-        pieces.append(np.full(lead_n, baseline))
-    for i in range(count):
-        scale = amplitudes[i % len(amplitudes)] if amplitudes else 1.0
-        pieces.append(element * scale)
-        after = gap_n[i % len(gap_n)]
-        if after:
-            pieces.append(np.full(after, baseline))
-    return np.concatenate(pieces)
+    # A shape's own detail is a fraction of the record, so it is the point
+    # count that decides whether it survives - the clock never enters into it.
+    for key, name, floor in (("rise", "rise", 0.0), ("fall", "fall", 0.0),
+                             ("edge", "edge", 0.0), ("flat", "flat top", 0.0),
+                             ("width", "width", 0.0)):
+        fraction = p.num(key, floor)
+        if 0 < fraction < 1 and fraction * n < 8:
+            lines.append(f"the {name} is {fraction:g} of the record, which is "
+                         f"{fraction * n:.2g} points - too few to shape it")
+    return lines
 
 
 # A sequence is built in real time against a sample clock, not in fractions of
@@ -516,7 +528,7 @@ _TIME_UNITS = {"s": 1.0, "ms": 1e-3, "m": 1e-3, "us": 1e-6, "u": 1e-6,
                "ns": 1e-9, "n": 1e-9}
 
 # (label, key, default, entry width). One row of these per segment.
-SEQ_COLUMNS = [("Shape", "shape", "Blackman", 16),
+SEQ_COLUMNS = [("Shape", "shape", "Blackman-Harris", 16),
                ("Time", "time", "1", 8),
                ("Ampl", "ampl", "1", 6),
                ("Carrier (Hz)", "freq", "0", 10),
@@ -525,7 +537,25 @@ SEQ_COLUMNS = [("Shape", "shape", "Blackman", 16),
                ("Extra (key=value)", "extra", "", 20)]
 
 
+def shape_extras(shape):
+    """A shape's own parameters as `key=value`, the carrier aside.
+
+    The builder gives each of them a labelled box. A sequence row has one free
+    text field instead, so the defaults are written into it when the shape is
+    picked - otherwise they are reachable but invisible, and you would have to
+    already know that a Tukey takes `flat=` to discover that it does.
+    """
+    if shape == SEQ_LOCAL:
+        return "name="
+    if shape not in BUILD_SHAPES:
+        return ""
+    return " ".join(f"{key}={default}"
+                    for _, key, default, _ in BUILD_SHAPES[shape][1]
+                    if key not in ("cycles", "cphase"))
+
+
 SEQ_DEFAULT = {key: default for _, key, default, _ in SEQ_COLUMNS}
+SEQ_DEFAULT["extra"] = shape_extras(SEQ_DEFAULT["shape"])
 
 # Settings a spec carries besides its segments. Without them a pasted sequence
 # is only half of itself: the same rows at the wrong clock are a different
@@ -540,6 +570,13 @@ def _as_bool(text, default=False):
     if value in ("off", "no", "false", "0"):
         return False
     return default
+
+
+def _hz(value):
+    for scale, suffix in ((1e6, " MHz"), (1e3, " kHz"), (1.0, " Hz")):
+        if abs(value) >= scale:
+            return f"{value / scale:.4g}{suffix}"
+    return f"{value:.4g} Hz"
 
 
 def _secs(value):
@@ -600,9 +637,17 @@ def seq_shapes():
     return list(BUILD_SHAPES) + [SEQ_LOCAL]
 
 
+# Shapes that have been renamed. Kept so a sequence spec written before the
+# rename still reads: the window really did change, but the file should not
+# have to be edited to find that out.
+SHAPE_ALIASES = {"blackman": "Blackman-Harris"}
+
+
 def resolve_shape(name):
     """Match a typed shape name case-insensitively, or say what is on offer."""
     text = str(name or "").strip()
+    if text.lower() in SHAPE_ALIASES:
+        return SHAPE_ALIASES[text.lower()]
     for candidate in seq_shapes():
         if candidate.lower() == text.lower():
             return candidate
@@ -640,8 +685,9 @@ def _segment_samples(shape, n, extra, cycles, phase, waves):
     name = str(extra.get("name", "")).strip()
     src = (waves or {}).get(name)
     if src is None:
-        raise ValueError(f"no local copy of a waveform called {name!r} - "
-                         "give the segment 'name=<waveform>'")
+        known = ", ".join(sorted(waves or {})) or "nothing loaded"
+        raise ValueError(f"no waveform called {name!r} - give the segment "
+                         f"'name=<waveform>', one of: {known}")
     src = np.asarray(src, dtype=np.float64).ravel()
     if src.size < 2:
         raise ValueError(f"{name!r} has too few samples to use")
@@ -655,9 +701,10 @@ def build_sequence(segments, rate, unit="us", baseline=0.0, coherent=False,
                    waves=None):
     """Concatenate differently-specified segments into one record.
 
-    Where `pulse_train` repeats one element, this stacks segments that need not
-    resemble each other: a Blackman at 5 MHz, a gap, the same envelope at half
-    the amplitude and ninety degrees, a slow ramp, a hold, a ramp back down.
+    Segments that need not resemble each other, laid end to end: a
+    Blackman-Harris at 5 MHz, a gap, the same envelope at half the amplitude
+    and ninety degrees, a slow ramp, a hold, a ramp back down. A plain train of
+    identical pulses is the case where every row is the same.
     Each segment carries its own shape, duration, amplitude, carrier frequency
     and phase, and its own gap to whatever follows.
 
@@ -1133,6 +1180,10 @@ PTS_PER_ARB_SAMPLE = 3      # a stored point cannot be resolved finer than itsel
 # sits at one rather than above it.
 DENSITY_LIMITS = {"cycle": 12.0, "pulse": 8.0, "edge": 4.0,
                   "stored point": 1.0}
+
+# Below this the shape is not merely coarse, it is a different shape: two
+# points per cycle is where a sampled sine stops carrying its own frequency.
+ALIAS_LIMIT = 2.0
 
 
 def preview_features(wvtp, vals, mode="Off", mod=None, arb=None,
@@ -1664,7 +1715,6 @@ class App:
         # already fill the height on a laptop screen.
         self.build_preview(right, pad)
         self.build_builder(right, pad)
-        self.build_train(right, pad)
         self.build_arb(right, pad)
 
         # --- log
@@ -1838,14 +1888,45 @@ class App:
                           width=17, state="readonly")
         cb.pack(side="left", padx=4)
         cb.bind("<<ComboboxSelected>>", lambda e: self.on_shape())
-        ttk.Label(r, text="Points:").pack(side="left", padx=(10, 2))
+        self.build_len_label = ttk.Label(r, text="Points:")
+        self.build_len_label.pack(side="left", padx=(10, 2))
         self.build_pts = tk.StringVar(value="10000")
         ttk.Entry(r, textvariable=self.build_pts, width=9).pack(side="left")
+        self.build_unit = tk.StringVar(value="us")
+        self.build_unit_box = ttk.Combobox(
+            r, textvariable=self.build_unit, values=list(SEQ_UNITS), width=4,
+            state="disabled")
+        self.build_unit_box.pack(side="left", padx=(2, 0))
+        self.build_unit_box.bind("<<ComboboxSelected>>",
+                                 lambda e: self.on_build_change())
         ttk.Button(r, text="Build", command=self.do_build).pack(side="left", padx=(10, 4))
         ttk.Button(r, text="Type/paste values...",
                    command=self.do_paste).pack(side="left")
         ttk.Button(r, text="Sequence...",
                    command=self.do_sequence).pack(side="left", padx=(4, 0))
+
+        # A carrier in cycles is rate-free and survives being replayed at any
+        # clock, which is why the builder works that way. But a carrier is
+        # usually known in hertz, and a record has a duration the moment a
+        # clock is named, so the panel will do the conversion either way.
+        c = ttk.Frame(f)
+        c.pack(fill="x", padx=6, pady=(0, 2))
+        self.build_real = tk.BooleanVar(value=False)
+        ttk.Checkbutton(c, text="Using real units with",
+                        variable=self.build_real,
+                        command=self.on_build_units).pack(side="left")
+        self.build_rate = tk.StringVar(value="1e6")
+        ttk.Entry(c, textvariable=self.build_rate, width=10).pack(side="left",
+                                                                 padx=(4, 2))
+        ttk.Label(c, text="Sa/s").pack(side="left")
+        # Wrapped rather than clipped: a warning that runs off the edge of the
+        # window is a warning nobody reads. The full text goes to the log on
+        # every build too, since this line is replaced by the next one.
+        self.build_note = ttk.Label(c, text="", foreground="#666",
+                                    justify="left", wraplength=520)
+        self.build_note.pack(side="left", padx=(10, 0))
+        for var in (self.build_pts, self.build_rate):
+            var.trace_add("write", lambda *_: self.on_build_change())
 
         g = ttk.Frame(f)
         g.pack(fill="x", padx=6, pady=(2, 6))
@@ -1857,35 +1938,149 @@ class App:
             var = tk.StringVar()
             box = ttk.Combobox(g, textvariable=var, width=13, state="normal")
             box.grid(row=row, column=col * 2 + 1, sticky="w", padx=2, pady=1)
+            var.trace_add("write", lambda *_: self.on_build_change())
             self.shape_labels.append(lab)
             self.shape_vars.append(var)
             self.shape_boxes.append(box)
         self.on_shape()
 
-    def on_shape(self):
-        """Relabel the parameter slots for the shape now selected."""
+    def on_shape(self, keep=False):
+        """Relabel the parameter slots for the shape now selected.
+
+        `keep` leaves the values alone, for the case where only the carrier's
+        units changed and the shape did not.
+        """
         spec = BUILD_SHAPES[self.shape.get()][1]
         for slot in range(BUILD_SLOTS):
             lab = self.shape_labels[slot]
             var = self.shape_vars[slot]
             box = self.shape_boxes[slot]
             if slot < len(spec):
-                label, _key, default, choices = spec[slot]
+                label, key, default, choices = spec[slot]
+                if key == "cycles" and self.build_real.get():
+                    label = "Carrier (Hz)"
                 lab.configure(text=label + ":", foreground="#000")
                 box.configure(values=list(choices) if choices else (),
                               state="readonly" if choices else "normal")
-                var.set(default)
+                if not keep:
+                    var.set(default)
             else:
                 lab.configure(text="")
                 box.configure(values=(), state="disabled")
-                var.set("")
+                if not keep:
+                    var.set("")
+        self.on_build_change()
+
+    def build_rate_value(self):
+        rate = _as_float(self.build_rate.get(), 0.0)
+        if rate <= 0:
+            raise ValueError("real units need a positive sample rate")
+        return rate
+
+    def build_points(self):
+        """How many samples the record will have, however it was asked for.
+
+        In real units the length box holds a time, because that is what setting
+        it actually changes: at a fixed clock a longer record is a longer pulse,
+        not a finer one. The point count falls out of the clock.
+        """
+        if not self.build_real.get():
+            return int(_as_float(self.build_pts.get(), 0.0))
+        span = parse_time(self.build_pts.get(), self.build_unit.get(), 0.0)
+        return int(round(span * self.build_rate_value()))
+
+    def build_values(self):
+        """The shape's parameters, with a carrier in hertz turned into cycles.
+
+        The library only knows cycles across the record, that being the one
+        description of a carrier which needs no clock. Hertz is the useful one
+        to type, so the conversion happens here: cycles = frequency x points /
+        rate.
+        """
+        spec = BUILD_SHAPES[self.shape.get()][1]
+        values = {spec[i][1]: self.shape_vars[i].get()
+                  for i in range(len(spec))}
+        carrier = None
+        if self.build_real.get() and "cycles" in values:
+            freq = _as_float(values["cycles"], 0.0)
+            if freq > 0:
+                points = self.build_points()
+                carrier = freq
+                values["cycles"] = f"{freq * points / self.build_rate_value():.10g}"
+        return values, carrier
+
+    def on_build_units(self):
+        """Switch the length and the carrier between points and real time.
+
+        The record itself does not change: the same 10000 points at 1 MSa/s is
+        10 ms either way, and the same 50 cycles across it is 5 kHz. Converting
+        rather than clearing means the box that was right a moment ago is still
+        right.
+        """
+        try:
+            rate = self.build_rate_value()
+        except ValueError as exc:
+            self.build_real.set(not self.build_real.get())
+            messagebox.showerror("Cannot use real units", str(exc))
+            return
+        spec = BUILD_SHAPES[self.shape.get()][1]
+        cycles_at = next((i for i in range(len(spec))
+                          if spec[i][1] == "cycles"), None)
+        real = self.build_real.get()
+
+        if real:
+            points = int(_as_float(self.build_pts.get(), 0.0))
+            unit = _TIME_UNITS[self.build_unit.get()]
+            self.build_pts.set(f"{points / rate / unit:.10g}" if points else "")
+            if cycles_at is not None and points:
+                cycles = _as_float(self.shape_vars[cycles_at].get(), 0.0)
+                self.shape_vars[cycles_at].set(f"{cycles * rate / points:.10g}")
+        else:
+            # Not build_points(): the checkbox has already flipped, so that
+            # would read the box as a point count when it is still a time.
+            points = int(round(parse_time(self.build_pts.get(),
+                                          self.build_unit.get(), 0.0) * rate))
+            if cycles_at is not None and points:
+                freq = _as_float(self.shape_vars[cycles_at].get(), 0.0)
+                self.shape_vars[cycles_at].set(f"{freq * points / rate:.10g}")
+            self.build_pts.set(str(points))
+
+        self.build_len_label.configure(text="Length:" if real else "Points:")
+        self.build_unit_box.configure(state="readonly" if real else "disabled")
+        self.on_shape(keep=True)
+
+    def on_build_change(self):
+        """Say what the record will come to, and what it cannot resolve."""
+        if not hasattr(self, "build_note"):
+            return                     # still building the panel
+        try:
+            values, carrier = self.build_values()
+            points = self.build_points()
+        except ValueError as exc:
+            self.build_note.configure(text=str(exc), foreground="#c60")
+            return
+        rate = _as_float(self.build_rate.get(), 0.0)
+        parts = []
+        if points >= 2 and rate > 0:
+            # Played straight through at this clock, a record of n points lasts
+            # n/rate and repeats at rate/n. Both are worth knowing before it is
+            # built rather than after it is on the generator.
+            parts.append(f"{points:,} pts = {_secs(points / rate)}, "
+                         f"repeats at {_hz(rate / points)}")
+        warnings = build_warnings(self.shape.get(), points, values, rate, carrier)
+        if warnings:
+            self.build_note.configure(
+                text=" | ".join(parts + warnings[:1]), foreground="#c60")
+        else:
+            self.build_note.configure(text=" | ".join(parts), foreground="#666")
 
     def do_build(self):
         shape = self.shape.get()
         spec = BUILD_SHAPES[shape][1]
-        values = {spec[i][1]: self.shape_vars[i].get() for i in range(len(spec))}
         try:
-            data = build_waveform(shape, int(float(self.build_pts.get())), values)
+            values, carrier = self.build_values()
+            points = self.build_points()
+            data = build_waveform(shape, points, values)
         except Exception as exc:
             self.log(f"Could not build {shape}: {exc}")
             messagebox.showerror("Cannot build waveform", str(exc))
@@ -1893,6 +2088,14 @@ class App:
         detail = ", ".join(f"{spec[i][0]}={self.shape_vars[i].get()}"
                            for i in range(len(spec)) if self.shape_vars[i].get())
         self.log(f"Built {shape}: {data.size} pts" + (f" ({detail})" if detail else ""))
+        rate = _as_float(self.build_rate.get(), 0.0)
+        if carrier:
+            self.log(f"  carrier {_hz(carrier)} at {rate:.10g} Sa/s "
+                     f"= {values['cycles']} cycles across the record")
+        # Logged as well as shown, because the label is one line and goes away
+        # the moment the next thing is built.
+        for line in build_warnings(shape, points, values, rate, carrier):
+            self.log(f"  warning: {line}")
         self.take_table(data.reshape(-1, 1), None, f"built {shape}",
                         shape.split("(")[0].strip().replace(" ", "_").lower())
 
@@ -1964,8 +2167,9 @@ class App:
             "(2u, 200m, 1.5s). Carrier is in hertz,\n"
             "which only means anything at the sample rate given. Extra takes "
             "the shape's own parameters as\n"
-            "key=value - start=0 end=1 for a ramp, level=1 for a hold, "
-            "name=<waveform> for a local waveform.")
+            "key=value. Picking a shape fills in that shape's own defaults,\n"
+            "so the row says what it will accept. name=pending reaches "
+            "whatever was last built, loaded or pasted.")
         ).pack(anchor="w", padx=8, pady=(8, 4))
 
         top = ttk.Frame(win)
@@ -2094,9 +2298,18 @@ class App:
         self._seq_info()
 
     def _seq_edit(self, index, key, var):
-        if 0 <= index < len(self.seq_data):
-            self.seq_data[index][key] = var.get()
-            self._seq_info()
+        if not 0 <= index < len(self.seq_data):
+            return
+        self.seq_data[index][key] = var.get()
+        if key == "shape":
+            # A new shape takes different parameters, so the ones the last
+            # shape took are not just stale, they are meaningless. Filling in
+            # the new defaults is also the only place the row says what the
+            # shape will accept.
+            self.seq_data[index]["extra"] = shape_extras(var.get())
+            self._seq_redraw()
+            return
+        self._seq_info()
 
     def _seq_add(self):
         self.seq_data.append(dict(SEQ_DEFAULT))
@@ -2142,10 +2355,16 @@ class App:
     def _seq_build(self):
         """Make the record and hand it to the pending waveform."""
         try:
+            # `pending` names whatever was last built, loaded or pasted, so a
+            # record that has never been uploaded can still be a segment - the
+            # case the pulse train used to cover.
+            waves = dict(self.known_waves)
+            if self.arb_element is not None:
+                waves["pending"] = self.arb_element
             out, rows = build_sequence(
                 self.seq_data, self.seq_rate.get(), unit=self.seq_unit.get(),
                 baseline=_as_float(self.seq_baseline.get(), 0.0),
-                coherent=bool(self.seq_coherent.get()), waves=self.known_waves)
+                coherent=bool(self.seq_coherent.get()), waves=waves)
         except Exception as exc:
             self.log(f"Could not build the sequence: {exc}")
             messagebox.showerror("Cannot build sequence", str(exc),
@@ -2159,7 +2378,12 @@ class App:
         for index, shape, n, span, gap in rows:
             self.log(f"  {index}. {shape}, {_secs(span)} ({n} pts)"
                      + (f", then {_secs(gap)} gap" if gap > 0 else ""))
+        element = self.arb_element
         self.take_table(out.reshape(-1, 1), None, "sequence", "sequence")
+        # A sequence must never become its own source. Left alone, a segment
+        # naming `pending` would fold the last result into the next one and the
+        # record would double every time Build was pressed.
+        self.arb_element = element
         if self.seq_set_clock.get():
             self._seq_set_clock(rate)
 
@@ -2279,78 +2503,6 @@ class App:
                                                                  padx=6)
         txt.focus_set()
 
-    def build_train(self, parent, pad):
-        f = ttk.LabelFrame(parent, text="Pulse train (repeats the pending waveform)")
-        f.pack(fill="x", **pad)
-
-        r1 = ttk.Frame(f)
-        r1.pack(fill="x", padx=6, pady=(6, 2))
-        self.train_vars = {}
-        for label, key, default, width in (
-                ("Pulses:", "count", "5", 6),
-                ("Period (x pulse):", "period", "2", 6),
-                ("Lead-in (x pulse):", "lead", "0", 6),
-                ("Baseline:", "baseline", "0", 6)):
-            ttk.Label(r1, text=label).pack(side="left", padx=(0, 3))
-            var = tk.StringVar(value=default)
-            self.train_vars[key] = var
-            ttk.Entry(r1, textvariable=var, width=width).pack(side="left", padx=(0, 8))
-        ttk.Button(r1, text="Make train", command=self.do_train).pack(side="left")
-
-        r2 = ttk.Frame(f)
-        r2.pack(fill="x", padx=6, pady=(2, 6))
-        for label, key, width in (("Per-pulse amplitude:", "amplitudes", 16),
-                                  ("Gaps (x pulse):", "gaps", 16)):
-            ttk.Label(r2, text=label).pack(side="left", padx=(0, 3))
-            var = tk.StringVar()
-            self.train_vars[key] = var
-            ttk.Entry(r2, textvariable=var, width=width).pack(side="left", padx=(0, 8))
-        self.train_info = ttk.Label(r2, text="", foreground="#666")
-        self.train_info.pack(side="left")
-
-    def do_train(self):
-        """Repeat the element into a train. Always rebuilt from the last thing
-        built, loaded or pasted, so changing the count and pressing again does
-        not make a train of the previous train."""
-        if self.arb_element is None:
-            self.log("Nothing to repeat - build, load or paste a waveform first.")
-            return
-        get = lambda k: self.train_vars[k].get()
-        try:
-            count = int(float(get("count")))
-            out = pulse_train(self.arb_element, count,
-                              period=float(get("period") or 2),
-                              lead=float(get("lead") or 0),
-                              baseline=float(get("baseline") or 0),
-                              amplitudes=parse_floats(get("amplitudes")),
-                              gaps=parse_floats(get("gaps")))
-        except Exception as exc:
-            self.log(f"Could not make the train: {exc}")
-            messagebox.showerror("Cannot make pulse train", str(exc))
-            return
-
-        element_n = self.arb_element.size
-        self.arb_samples = out
-        self.arb_table = out.reshape(-1, 1)
-        self.arb_source = f"train of {count} x {element_n} pts"
-        self.arb_col_box.configure(values=["column 1"], state="disabled")
-        self.arb_col.set("column 1")
-        self.show_pending.set(True)
-        self.arb_info.configure(text=f"{self.arb_source} = {out.size} pts",
-                                foreground="#000")
-
-        # Say what it comes to in real time on the channel it is aimed at, since
-        # the train is specified in pulse lengths and the bench thinks in
-        # seconds.
-        target = int(self.arb_ch.get())
-        span = self.pending_period(target, out.size)
-        self.train_info.configure(
-            text=f"{out.size} pts, {span * 1e3:.4g} ms on CH{target}")
-        self.log(f"Pulse train: {count} x {element_n} pts -> {out.size} pts "
-                 f"({span * 1e3:.4g} ms at the CH{target} clock)")
-        self.set_busy(self.busy)
-        self.draw_preview()
-
     def build_arb(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Upload arbitrary waveform")
         f.pack(fill="x", **pad)
@@ -2388,6 +2540,8 @@ class App:
         self.upload_btn = ttk.Button(r2, text="Upload", command=self.do_upload,
                                      state="disabled")
         self.upload_btn.pack(side="left", padx=4)
+        ttk.Button(r2, text="Clear pending",
+                   command=self.do_clear_pending).pack(side="left")
 
     def build_memory(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Waveforms in generator memory")
@@ -2580,13 +2734,15 @@ class App:
         # A value the panel worked out stops being one the moment it is typed
         # over, so the tint comes off at the first keystroke in the box.
         self.computed.discard(key)
-        group = self.linked_group(key)
-        if group and not self.loading:
-            # Of two cells locked to each other, the one just typed in is the
-            # setting and the other becomes the arithmetic. Not while a read is
-            # landing: the generator reporting both is not a choice between
-            # them.
-            self.driver[group] = key
+        if not self.loading:
+            # The cell just typed in is the setting, and everything describing
+            # the same thing another way becomes the arithmetic. Not while a
+            # read is landing: the generator reporting every cell at once is
+            # not a choice between them.
+            for group in self.groups_for(key):
+                self.driver[group] = key
+            if key.startswith("C") and ":BSWV:" in key:
+                self.recompute(int(key[1]))
         self.refresh_marks()
         self.draw_preview()
 
@@ -2595,16 +2751,17 @@ class App:
         return self.vars[key].get().strip() != self.inst_vals[key]
 
     def linked_groups(self, ch):
-        """Cells on this channel that are one setting in two guises.
+        """Cells on this channel that are one setting in different guises.
 
-        Set either half and the generator works the other out, so which of them
-        is a setting and which is arithmetic is not fixed - it is whichever was
-        typed in last. Each group is ordered with the half that drives it until
-        told otherwise first.
+        A group is a tuple of sides, and every side says the same thing a
+        different way - so typing into one side makes every cell on the others
+        arithmetic. The first side leads until told otherwise. Sides rather
+        than single cells because the levels take two of each: amplitude and
+        offset together are high and low together.
 
-        Both groups depend on the wave type, which is why this is computed
-        rather than a constant: a pulse has no sample clock to speak of and an
-        arb has no duty cycle.
+        Computed rather than a constant because which relations are real
+        depends on the wave type: a pulse has no sample clock to speak of, an
+        arb has no duty cycle, and DC has no frequency to have a period.
         """
         wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
         groups = []
@@ -2614,39 +2771,127 @@ class App:
         # and what the sequence builder fills in.
         if wvtp == "ARB" and \
                 self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB":
-            groups.append((f"C{ch}:SRATE:VALUE", f"C{ch}:BSWV:FRQ"))
+            groups.append(((f"C{ch}:SRATE:VALUE",), (f"C{ch}:BSWV:FRQ",)))
+        if wvtp in OSCILLATING:
+            # Reciprocals. Frequency leads because that is what the rest of the
+            # panel is written in - the modulation row, the sweep, the preview.
+            groups.append(((f"C{ch}:BSWV:FRQ",), (f"C{ch}:BSWV:PERI",)))
+            # The same span of volts from the middle or from the ends:
+            # high = offset + ampl/2, low = offset - ampl/2. Amplitude and
+            # offset lead, being what the output is specified in.
+            groups.append(((f"C{ch}:BSWV:AMP", f"C{ch}:BSWV:OFST"),
+                           (f"C{ch}:BSWV:HLEV", f"C{ch}:BSWV:LLEV")))
         # A pulse width is its duty against the period: width = duty / 100 /
         # freq. Width leads, being the absolute one - and the one the preview
         # already prefers when both are set.
         if wvtp == "PULSE":
-            groups.append((f"C{ch}:BSWV:WIDTH", f"C{ch}:BSWV:DUTY"))
+            groups.append(((f"C{ch}:BSWV:WIDTH",), (f"C{ch}:BSWV:DUTY",)))
         return groups
 
-    def linked_group(self, key):
-        """The group `key` belongs to as things stand, or () when it stands
-        alone."""
+    def groups_for(self, key):
+        """Every linked group this cell belongs to as things stand.
+
+        More than one is normal: under TrueArb the frequency is both the far
+        side of the sample clock and the near side of the period.
+        """
         for ch in CHANNELS:
             if key.startswith(f"C{ch}:"):
-                for group in self.linked_groups(ch):
-                    if key in group:
-                        return group
-        return ()
+                return [group for group in self.linked_groups(ch)
+                        if any(key in side for side in group)]
+        return []
+
+    def driving_side(self, group):
+        """The side of a group that is currently the setting."""
+        driver = self.driver.get(group)
+        for side in group:
+            if driver in side:
+                return side
+        return group[0]
+
+    def derived(self, key):
+        """True when some other cell is the setting and this one is its result.
+
+        Never sent. The generator works it out, and putting both descriptions
+        of one setting into a single command is two instructions with the last
+        one winning.
+        """
+        return any(key not in self.driving_side(group)
+                   for group in self.groups_for(key))
 
     def is_computed(self, key):
         """True when this cell shows arithmetic rather than a setting.
 
         Two ways a number lands in a box without being typed there. It is the
-        far side of a pair the generator keeps in step - see `linked_group`.
+        far side of a pair the generator keeps in step - see `linked_groups`.
         Or this app worked it out, which is what the sequence builder does with
-        the clock a record specified in seconds needs to be played at.
+        the clock a record specified in seconds needs to be played at; that one
+        is sent, so it is not `derived`.
         """
-        if key in self.computed:
-            return True
-        group = self.linked_group(key)
-        # The sample rate drives until told otherwise: it is the setting a
-        # TrueArb record is actually clocked by, and the one the sequence
-        # builder fills in.
-        return bool(group) and key != self.driver.get(group, group[0])
+        return key in self.computed or self.derived(key)
+
+    def recompute(self, ch):
+        """Bring the derived side of every pair on this channel into step.
+
+        Showing a period beside a frequency only earns its place if setting
+        either fills in the other; two boxes left to disagree would be worse
+        than one box. One pass over the channel rather than a reaction to the
+        keystroke, so that a chain lands at once - a new frequency moves the
+        period, and moves the duty that an unchanged width now implies.
+
+        The frequency/sample-rate pair is left out on purpose. Working it out
+        needs the record's point count, which lives on the generator rather
+        than in the panel, so the panel can say that cell is arithmetic without
+        being able to do the arithmetic itself.
+        """
+        def num(key):
+            try:
+                return float(self.vars[f"C{ch}:BSWV:{key}"].get().strip())
+            except ValueError:
+                return None
+
+        drives = {key.rsplit(":", 1)[1] for group in self.linked_groups(ch)
+                  for key in self.driving_side(group)}
+        new = {}
+
+        if "FRQ" in drives:
+            freq = num("FRQ")
+            new["PERI"] = 1.0 / freq if freq else None
+        elif "PERI" in drives:
+            peri = num("PERI")
+            new["FRQ"] = 1.0 / peri if peri else None
+
+        if "AMP" in drives:
+            amp, ofst = num("AMP"), num("OFST")
+            pair = (ofst + amp / 2, ofst - amp / 2) \
+                if amp is not None and ofst is not None else (None, None)
+            new["HLEV"], new["LLEV"] = pair
+        elif "HLEV" in drives:
+            high, low = num("HLEV"), num("LLEV")
+            pair = (high - low, (high + low) / 2) \
+                if high is not None and low is not None else (None, None)
+            new["AMP"], new["OFST"] = pair
+
+        # Whichever way the first pair went, the width and duty hang off the
+        # frequency that came out of it.
+        freq = new.get("FRQ") if isinstance(new.get("FRQ"), float) else num("FRQ")
+        if "WIDTH" in drives:
+            width = num("WIDTH")
+            new["DUTY"] = width * freq * 100.0 \
+                if freq and width is not None else None
+        elif "DUTY" in drives:
+            duty = num("DUTY")
+            new["WIDTH"] = duty / 100.0 / freq \
+                if freq and duty is not None else None
+
+        self.quiet = True
+        try:
+            for key, value in new.items():
+                var = self.vars[f"C{ch}:BSWV:{key}"]
+                text = "" if value is None else fmt_value(value)
+                if var.get().strip() != text:
+                    var.set(text)
+        finally:
+            self.quiet = False
 
     def refresh_marks(self):
         if not hasattr(self, "sync"):
@@ -2662,8 +2907,10 @@ class App:
                 halo.configure(bg=COMPUTED_BG if live and self.is_computed(key)
                                else self.halo_off)
             # A disabled cell is not part of the current wave type, so whatever
-            # is left in it is stale rather than an edit waiting to be applied.
-            if not live:
+            # is left in it is stale rather than an edit waiting to be applied;
+            # a derived one moved because something else was typed, and is not
+            # going to be sent either.
+            if not live or self.derived(key):
                 mark.configure(text=" ")
                 continue
             if self.edited(key):
@@ -2698,6 +2945,11 @@ class App:
                 foreground="#000" if on else "#aaa")
 
         self.check_pwm(ch)
+        if not self.loading:
+            # A different wave type is a different set of pairs - a pulse gains
+            # a duty, DC loses its period - so the derived cells are worked out
+            # again rather than left holding the last type's answers.
+            self.recompute(ch)
 
         arb = wvtp == "ARB"
         tarb = arb and self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB"
@@ -2917,7 +3169,8 @@ class App:
 
         def add(verb, key, panel_key):
             if self.edited(panel_key) and \
-                    str(self.widgets[panel_key].cget("state")) != "disabled":
+                    str(self.widgets[panel_key].cget("state")) != "disabled" \
+                    and not self.derived(panel_key):
                 blocks.setdefault(verb, {})[key] = self.vars[panel_key].get().strip()
 
         add("OUTP", "LOAD", f"C{ch}:OUTP:LOAD")
@@ -3163,6 +3416,26 @@ class App:
         self.arb_info.configure(text=note, foreground="#000")
         self.log(f"  using column {index + 1}: {data.size} pts, "
                  f"{data.min():g} to {data.max():g}")
+        self.set_busy(self.busy)
+        self.draw_preview()
+
+    def do_clear_pending(self):
+        """Drop the waveform waiting to be uploaded.
+
+        Nothing on the generator is touched - this is the panel forgetting, not
+        the instrument. Worth having because the pending record is otherwise
+        only replaced, never let go: build something by mistake and it stays on
+        the preview, and one wrong press of Upload puts it on a channel.
+        """
+        if self.arb_samples is None and self.arb_table is None:
+            return
+        was = self.arb_source or "pending waveform"
+        self.arb_samples = self.arb_table = self.arb_element = None
+        self.arb_source = ""
+        self.arb_col_box.configure(values=(), state="disabled")
+        self.arb_col.set("")
+        self.arb_info.configure(text="no file loaded", foreground="#666")
+        self.log(f"Pending waveform cleared ({was}). Nothing was sent.")
         self.set_busy(self.busy)
         self.draw_preview()
 
