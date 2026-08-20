@@ -2469,6 +2469,8 @@ class App:
             child.destroy()
         # The variables have to be held here: a StringVar that is garbage
         # collected takes its Tcl variable with it, and the row goes blank.
+        # Keyed by row and column rather than in one flat list, so one cell can
+        # be written without rebuilding the row it sits in.
         self.seq_vars = []
 
         heads = ["#"] + [label for label, _, _, _ in SEQ_COLUMNS]
@@ -2479,11 +2481,13 @@ class App:
         for index, seg in enumerate(self.seq_data):
             ttk.Label(self.seq_body, text=str(index + 1),
                       foreground="#666").grid(row=index + 1, column=0, padx=(2, 4))
+            row_vars = {}
+            self.seq_vars.append(row_vars)
             for col, (_, key, _, width) in enumerate(SEQ_COLUMNS, start=1):
                 var = tk.StringVar(value=str(seg.get(key, "")))
                 var.trace_add("write", lambda *_, i=index, k=key, v=var:
                               self._seq_edit(i, k, v))
-                self.seq_vars.append(var)
+                row_vars[key] = var
                 if key == "shape":
                     widget = ttk.Combobox(self.seq_body, textvariable=var,
                                           values=seq_shapes(), width=width,
@@ -2517,9 +2521,19 @@ class App:
             # shape took are not just stale, they are meaningless. Filling in
             # the new defaults is also the only place the row says what the
             # shape will accept.
-            self.seq_data[index]["extra"] = shape_extras(var.get())
-            self._seq_redraw()
-            return
+            #
+            # Written into the box where it stands rather than by rebuilding
+            # the row. Rebuilding destroyed the combobox whose callback this
+            # is, and a readonly combobox holds a grab while its dropdown
+            # closes - destroy it first and the grab is never released, which
+            # left every box in the window deaf to the keyboard until it was
+            # clicked away from and back.
+            row = self.seq_vars[index] if index < len(self.seq_vars) else {}
+            defaults = shape_extras(var.get())
+            if "extra" in row:
+                row["extra"].set(defaults)
+            else:
+                self.seq_data[index]["extra"] = defaults
         self._seq_info()
 
     def _seq_add(self):
