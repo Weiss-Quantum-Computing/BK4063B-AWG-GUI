@@ -74,6 +74,17 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
   this app previews even sessions later; one put there by other means shows a
   note instead of a guess. See [Reading the preview](#reading-the-preview).
 
+### Output load
+
+The dropdown offers `50` and `HZ`, which is what the generator's own front panel
+offers. The box is typeable, though, because the remote interface accepts
+anything from 50 ohm up to 100k and reads it back - 49 gets clamped to 50. A load
+set that way is real but will not show on the instrument's screen, so it is worth
+knowing you set it.
+
+Whatever it says, the declared load rescales amplitude: see
+[Command ordering](#command-ordering).
+
 ## Building a waveform in the panel
 
 **Build waveform** makes the samples for you: pick a **Shape**, set **Points**,
@@ -155,6 +166,9 @@ output voltages - the amplitude and offset actually produced come from **Ampl
 (Vpp)** and **Offset (V)** on the channel, exactly as for a built-in wave. A
 waveform captured at 0 to 5.8 V and one at -1 to +1 upload to the same thing.
 
+The **pending** trace shows the samples as the DAC will get them, not as the file
+holds them, so a waveform does not change height the moment it is uploaded.
+
 `normalise to full scale` (on by default) divides by the largest absolute sample,
 so the biggest excursion reaches the DAC's full scale. Asymmetry is kept: a
 capture sitting entirely above zero still comes out entirely above the offset,
@@ -163,7 +177,11 @@ using half the range. Turn normalising off if your samples are already in
 range is clipped.
 
 Samples go out as signed 16-bit little-endian, matching the 4063B's 16-bit DAC.
-An odd point count is rejected by the instrument, so the last sample is dropped.
+Any point count from 2 upwards is fine, odd included - 3, 7 and 101 points
+all store and read back at exactly their length. An earlier version of this
+app dropped the last sample of an odd record on the assumption that the
+generator would not take one. It does; the assumption was never tested and
+was simply wrong.
 There is no small size limit to design around - a 1,000,000-point record uploads
 in one go.
 

@@ -289,13 +289,13 @@ class BK4063B:
         exactly (values outside that range are clipped).
 
         Sent as signed 16-bit little-endian, which is what the 16-bit DAC in the
-        4063B expects. Point count must be even.
+        4063B expects. Any count from 2 upwards works, odd included - measured,
+        not assumed: 3, 7 and 101 points all store and read back at exactly
+        their length.
         """
         data = [float(s) for s in samples]
         if len(data) < 2:
             raise ValueError("need at least 2 samples")
-        if len(data) % 2:
-            raise ValueError(f"point count must be even, got {len(data)}")
 
         if normalize:
             peak = max(abs(min(data)), abs(max(data)))

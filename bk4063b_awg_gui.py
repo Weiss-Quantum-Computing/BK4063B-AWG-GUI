@@ -62,7 +62,11 @@ CHANNELS = (1, 2)
 # y axis, so a glance at any of them identifies the others.
 CH_COLOUR = {1: "#1f77b4", 2: "#d62728"}      # blue, red
 WAVE_TYPES = ("SINE", "SQUARE", "RAMP", "PULSE", "NOISE", "DC", "ARB")
-LOADS = ("50", "75", "100", "600", "10000", "HZ")
+# The front panel only offers these two, so they are what the dropdown shows.
+# The remote interface will actually take anything from 50 ohm to 100k (49 gets
+# clamped to 50), and the cell stays typeable so an odd value can still be set -
+# it just will not be visible on the generator's own screen.
+LOADS = ("50", "HZ")
 
 BAD_NAME_CHARS = r'<>:"/\|?*'
 
@@ -400,8 +404,6 @@ def build_waveform(shape, n_points, values):
     n = int(n_points)
     if n < 2:
         raise ValueError("need at least 2 points")
-    if n % 2:
-        n += 1                              # the generator rejects odd counts
     builder, _ = BUILD_SHAPES[shape]
     p = _Params(values)
     y = np.asarray(builder(n, p), dtype=np.float64)
@@ -495,6 +497,24 @@ def default_column(names, ncols):
                 return i
     # Unnamed: a lone column is the data, and a pair is time,volts.
     return 0 if ncols == 1 else 1
+
+
+def dac_samples(samples, normalize=True):
+    """The samples exactly as the DAC will receive them, in -1..+1.
+
+    One definition on purpose. This used to be written out separately where the
+    bytes were packed, where the local copy was kept, and not at all where the
+    pending trace was drawn - so the preview showed raw file values while
+    everything after the upload showed normalised ones, and the same waveform
+    changed height the moment it was sent.
+    """
+    data = np.asarray(samples, dtype=np.float64).ravel()
+    if normalize:
+        peak = float(np.max(np.abs(data)))
+        if peak == 0:
+            raise ValueError("all samples are zero; nothing to normalise")
+        data = data / peak
+    return np.clip(data, -1.0, 1.0)
 
 
 def cache_file(name):
@@ -955,19 +975,15 @@ class Awg:
         """Upload a waveform into user memory and select it on this channel.
 
         Sent as signed 16-bit little-endian, which is what the 16-bit DAC in the
-        4063B expects. Point count must be even.
+        4063B expects. Any point count from 2 upwards is fine - odd included,
+        which was measured rather than assumed: 3, 7 and 101 points all store
+        and read back at exactly their length.
         """
         data = np.asarray(samples, dtype=np.float64).ravel()
         if data.size < 2:
             raise ValueError("need at least 2 samples")
-        if data.size % 2:
-            data = data[:-1]                     # odd counts are rejected outright
-        if normalize:
-            peak = float(np.max(np.abs(data)))
-            if peak == 0:
-                raise ValueError("all samples are zero; nothing to normalise")
-            data = data / peak
-        codes = np.clip(np.round(data * 32767), -32768, 32767).astype("<i2")
+        data = dac_samples(data, normalize=normalize)
+        codes = np.round(data * 32767).astype("<i2")
 
         header = f"C{ch}:WVDT WVNM,{name},WAVEDATA,".encode("ascii")
         # One write_raw so the USBTMC END bit lands after the last data byte; a
@@ -1151,7 +1167,11 @@ class App:
         setattr(self, f"on_btn{ch}", on_btn)
         setattr(self, f"off_btn{ch}", off_btn)
         ttk.Label(o, text="Load:").pack(side="left", padx=(12, 0))
-        self.cell(self._grid(o), f"C{ch}:OUTP:LOAD", LOADS, 0, 0, 9)
+        # Typeable, not a fixed list: the generator takes any load from 50
+        # ohm up, even though only these two appear on its own screen.
+        load = self.cell(self._grid(o), f"C{ch}:OUTP:LOAD", LOADS, 0, 0, 9)
+        load.configure(state="normal")
+        self.natural[f"C{ch}:OUTP:LOAD"] = "normal"
         ttk.Label(o, text="Polarity:").pack(side="left", padx=(8, 0))
         self.cell(self._grid(o), f"C{ch}:OUTP:PLRT", ("NOR", "INVT"), 0, 0, 9)
 
@@ -2002,10 +2022,7 @@ class App:
                 # waveform whenever it is the one selected. The generator
                 # cannot read a stored waveform back out, so if we do not
                 # remember it here, nothing can ever show it.
-                kept = np.asarray(samples, dtype=np.float64).ravel()[:n]
-                if norm:
-                    kept = kept / (float(np.max(np.abs(kept))) or 1.0)
-                self.known_waves[name] = np.clip(kept, -1.0, 1.0)
+                self.known_waves[name] = dac_samples(samples, normalize=norm)
                 cache_save(name, self.known_waves[name])
                 blocks = {c: self.awg.read_channel(c) for c in CHANNELS}
                 names = self.awg.user_waveforms()
@@ -2240,8 +2257,15 @@ class App:
 
         wanted = [ch for ch in CHANNELS if self.show_ch[ch].get()]
         target = int(self.arb_ch.get())
-        pending = (self.arb_samples if self.show_pending.get()
-                   and self.arb_samples is not None else None)
+        pending = None
+        if self.show_pending.get() and self.arb_samples is not None:
+            try:
+                # Draw what will be stored, not what came out of the file: the
+                # upload normalises, so raw values here would put the same
+                # waveform at a different height before and after sending.
+                pending = dac_samples(self.arb_samples, normalize=self.norm.get())
+            except ValueError:
+                pending = None
 
         periods = [self.channel_period(ch) for ch in wanted]
         if pending is not None:
@@ -2279,8 +2303,11 @@ class App:
             vals = {key: self.vars[f"C{target}:BSWV:{key}"].get().strip()
                     for key, _, _ in WAVE_PARAMS}
             hold = self.arb_style(target)[0] == "steps-post"
-            curve = preview_curve("ARB", vals, arb=pending, hold=hold, span=span,
-                                  period=self.pending_period(target, pending.size))
+            mode, mod = self.channel_mode(target)
+            curve = preview_curve(
+                "ARB", vals, arb=pending, hold=hold, span=span, mode=mode, mod=mod,
+                invert=self.vars[f"C{target}:OUTP:PLRT"].get().strip() == "INVT",
+                period=self.pending_period(target, pending.size))
             if curve is not None:
                 t, v = curve[:2]
                 handles += axis.plot(
