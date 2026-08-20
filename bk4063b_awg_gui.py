@@ -99,6 +99,11 @@ WAVE_PARAMS = [
 MOD_SHAPES = ("SINE", "SQUARE", "TRIANGLE", "UPRAMP", "DNRAMP", "NOISE", "ARB")
 SOURCES = ("INT", "EXT")
 
+# The one carrier the generator really insists on: PWM widens a pulse, so there
+# is nothing for it to act on unless the wave type is PULSE. The rest of the
+# modes take any of SINE/SQUARE/RAMP/ARB.
+PWM_CARRIER = "PULSE"
+
 # Modulation, sweep and burst are one panel row because the instrument treats
 # them as one setting: only one can be active at a time. Each entry is
 # (label, SCPI key, choices or None); choices make the cell a fixed dropdown.
@@ -772,7 +777,111 @@ def preview_period(wvtp, vals, mode="Off", mod=None):
     return carrier
 
 
-def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000, hold=True,
+# How finely the preview is sampled. The window is sized by the modulating
+# envelope rather than by the carrier, so a slow modulation on a fast carrier
+# can put thousands of carrier cycles inside one picture, and a fixed point
+# budget then draws an alias instead of the waveform. The count is chosen per
+# trace from what is actually in it, between a floor that keeps a plain tone
+# smooth and a ceiling that keeps a redraw-per-keystroke responsive.
+PREVIEW_MIN_POINTS = 2000
+PREVIEW_MAX_POINTS = 20000
+PTS_PER_CYCLE = 40          # what a smooth oscillating trace wants
+PTS_PER_ARB_SAMPLE = 3      # a stored point cannot be resolved finer than itself
+
+# Points per feature below which the preview stops being a faithful picture.
+# A dozen points across a cycle already puts the drawn peak about 3% low, and
+# below two the shape itself is wrong. A stored arb point is its own limit -
+# one preview point each already shows every sample there is - so its threshold
+# sits at one rather than above it.
+DENSITY_LIMITS = {"cycle": 12.0, "pulse": 8.0, "edge": 4.0,
+                  "stored point": 1.0}
+
+
+def preview_features(wvtp, vals, mode="Off", mod=None, arb=None):
+    """Everything in the trace that has to be resolved, as
+    (per second, what one of them is called, points wanted each).
+
+    Separate from `preview_period`, which answers how *long* to draw. How
+    *finely* is a different question with a different answer: the window
+    follows the modulating envelope while the detail follows the carrier, its
+    deviation, a pulse edge, or the stored points of an arb.
+    """
+    num, mnum = _numget(vals), _numget(mod or {})
+    freq = num("FRQ", 1000.0)
+    if freq <= 0:
+        freq = 1000.0
+
+    rate = freq
+    if mode == "FM":
+        rate = freq + abs(mnum("DEVI"))
+    elif mode == "FSK":
+        rate = max(rate, mnum("HFRQ", freq))
+    elif mode == "Sweep":
+        rate = max(rate, mnum("START", freq), mnum("STOP", freq))
+    out = [(rate, "cycle", PTS_PER_CYCLE)]
+
+    if wvtp == "PULSE":
+        width = num("WIDTH")
+        if width > 0:
+            out.append((1.0 / width, "pulse", PTS_PER_CYCLE))
+        for key in ("RISE", "FALL"):
+            edge = num(key)
+            # An edge thousands of times shorter than the period is drawn as
+            # the vertical step it may as well be. Only an edge long enough to
+            # show as a slope is worth resolving.
+            if edge > 0.002 / freq:
+                out.append((1.0 / edge, "edge", PTS_PER_CYCLE))
+    elif wvtp == "ARB" and arb is not None and len(arb) >= 2:
+        out.append((freq * len(arb), "stored point", PTS_PER_ARB_SAMPLE))
+    return out
+
+
+def _key_rate(mode, mod):
+    """Edges per second of whatever gates the trace on and off, or 0."""
+    mnum = _numget(mod or {})
+    if mode in ("ASK", "FSK", "PSK"):
+        return 2.0 * mnum("KFRQ", 0.0)          # one edge per keyed state
+    if mode == "Burst" and \
+            str((mod or {}).get("GATE_NCYC", "NCYC")).upper() != "GATE":
+        prd = mnum("PRD", 0.0)
+        return 1.0 / prd if prd > 0 else 0.0
+    return 0.0
+
+
+def preview_points(span, wvtp, vals, mode="Off", mod=None, arb=None):
+    """How many samples to draw `span` seconds with.
+
+    Deterministic, so the plot and the warning about the plot agree without
+    having to pass the count between them.
+    """
+    want = max(per * span * rate for rate, _, per
+               in preview_features(wvtp, vals, mode, mod, arb))
+    n = int(min(max(PREVIEW_MIN_POINTS, want), PREVIEW_MAX_POINTS))
+
+    # Land the grid exactly on the keying edges. A gate that switches between
+    # two samples slopes into its off state and leaves it a sample late, which
+    # on ASK - the one mode whose off state is a flat zero - reads as points
+    # missing from the zero rather than as a square edge.
+    edges = _key_rate(mode, mod) * span
+    if 1.0 <= edges <= n:
+        n = int(round(round((n - 1) / edges) * edges)) + 1
+    return max(2, min(n, PREVIEW_MAX_POINTS))
+
+
+def preview_aliasing(span, n, wvtp, vals, mode="Off", mod=None, arb=None):
+    """True when `n` points across `span` seconds cannot draw this faithfully.
+
+    Asked of a whole trace rather than of one feature: the panel says which
+    channel to distrust, not which parameter of it, so anything too fine for
+    the budget is enough to answer yes.
+    """
+    if span <= 0:
+        return False
+    return any(rate > 0 and n / (span * rate) < DENSITY_LIMITS.get(unit, 8.0)
+               for rate, unit, _ in preview_features(wvtp, vals, mode, mod, arb))
+
+
+def preview_curve(wvtp, vals, arb=None, periods=2.0, n=None, hold=True,
                   period=None, span=None, mode="Off", mod=None, invert=False):
     """What the panel currently describes, in volts against seconds.
 
@@ -785,6 +894,10 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000, hold=True,
     on one shared time axis: two channels running at different frequencies are
     simultaneous in the real world, and drawing each over its own private window
     would imply they line up when they do not.
+
+    `n` is the number of samples to draw with; left out, it is chosen from
+    what the trace contains, because the window is sized by the envelope and a
+    fixed budget across it leaves a fast carrier undersampled.
 
     `mode` and `mod` carry the modulation/sweep/burst row. Everything that
     varies with time is folded into an instantaneous frequency, a phase offset
@@ -805,6 +918,8 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000, hold=True,
         period = preview_period(wvtp, vals, mode, mod)
     if span is None:
         span = periods * period
+    if n is None:
+        n = preview_points(span, wvtp, vals, mode, mod, arb)
     t = np.linspace(0.0, span, n)
     dt = t[1] - t[0] if n > 1 else 1.0
 
@@ -1111,6 +1226,14 @@ class App:
         self.natural = {}             # key -> state to restore when re-enabled
         self.arb_labels = {}          # key -> its caption, for greying out
         self.out_state = {ch: None for ch in CHANNELS}
+
+        # The mode row's boxes are shared by every mode, so what each one means
+        # is remembered here: without it a switch of mode leaves the old values
+        # sitting under the new labels.
+        self.mode_shown = {ch: "Off" for ch in CHANNELS}
+        self.pwm_bad = {ch: False for ch in CHANNELS}
+        self.loading = False          # panel being filled from the generator
+        self.quiet = False            # a var write that is not a user edit
 
         root.title("BK4063B AWG GUI")
         win_w = min(1330, root.winfo_screenwidth() - 80)
@@ -1676,6 +1799,11 @@ class App:
         self.show_pending = tk.BooleanVar(value=True)
         ttk.Checkbutton(r, text="pending", variable=self.show_pending,
                         command=self.draw_preview).pack(side="left", padx=(8, 0))
+        # Sits with the trace switches because that is what it is about: a
+        # caveat on the picture belongs beside the picture, where it can change
+        # on every keystroke without a log filling up behind it.
+        self.alias_note = ttk.Label(r, text="", foreground="#c60")
+        self.alias_note.pack(side="left", padx=(14, 4))
         self.split_y = tk.BooleanVar(value=False)
         ttk.Checkbutton(r, text="separate Y axes", variable=self.split_y,
                         command=self.draw_preview).pack(side="right")
@@ -1700,6 +1828,11 @@ class App:
     def on_edit(self, key, on_change):
         if on_change:
             on_change()
+        # A rewrite the panel did to itself (moving the mode row's values to
+        # where the new mode keeps them) is not an edit, and redrawing halfway
+        # through one would show a row that is part old mode and part new.
+        if self.quiet:
+            return
         self.refresh_marks()
         self.draw_preview()
 
@@ -1748,6 +1881,8 @@ class App:
             getattr(self, f"lab{ch}_{key}").configure(
                 foreground="#000" if on else "#aaa")
 
+        self.check_pwm(ch)
+
         arb = wvtp == "ARB"
         tarb = arb and self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB"
         for key, on in ((f"C{ch}:ARWV:NAME", arb), (f"C{ch}:SRATE:MODE", arb),
@@ -1758,9 +1893,16 @@ class App:
                 label.configure(foreground="#000" if on else "#aaa")
 
     def on_mode(self, ch):
-        """Relabel the mode parameter slots for the mode now selected."""
+        """Relabel the mode parameter slots for the mode now selected, and move
+        their values to wherever the new mode keeps them."""
         mode = self.vars[f"C{ch}:MODE"].get().strip() or "Off"
         spec = MODE_PARAMS.get(mode, [])
+        # Not while the panel is being filled from the generator: there the
+        # fresh values arrive straight after and carrying the old ones over
+        # would fight with them.
+        if not self.loading and self.mode_shown.get(ch) != mode:
+            self.remap_mode_slots(ch, self.mode_shown.get(ch), mode)
+        self.mode_shown[ch] = mode
         for slot in range(MODE_SLOTS):
             lab = getattr(self, f"modlab{ch}_{slot}")
             w = self.widgets[f"C{ch}:MODE:{slot}"]
@@ -1772,6 +1914,58 @@ class App:
             else:
                 lab.configure(text="")
                 w.configure(values=(), state="disabled")
+        self.check_pwm(ch)
+
+    def remap_mode_slots(self, ch, old, new):
+        """Carry the mode row across a change of mode, matched on meaning.
+
+        The row is one set of boxes reused by every mode, and the modes do not
+        agree on the order: ASK is (key freq, source) while FSK is (key freq,
+        hop freq, source). Kept by position, a source of INT lands under the
+        Hop freq label and reads as a hop frequency somebody chose. So a value
+        survives only when the new mode has the same SCPI parameter, and every
+        other box starts empty rather than holding a number typed for
+        something else.
+        """
+        carried = {}
+        for slot, (_, key, _) in enumerate(MODE_PARAMS.get(old or "Off", [])):
+            value = self.vars[f"C{ch}:MODE:{slot}"].get().strip()
+            if value:
+                carried[key] = value
+        spec = MODE_PARAMS.get(new, [])
+        self.quiet = True
+        try:
+            for slot in range(MODE_SLOTS):
+                key = spec[slot][1] if slot < len(spec) else None
+                self.vars[f"C{ch}:MODE:{slot}"].set(
+                    carried.get(key, "") if key else "")
+        finally:
+            self.quiet = False
+
+    def pwm_ok(self, ch):
+        """PWM is the one mode the carrier constrains: there is nothing for it
+        to widen unless the wave type is PULSE."""
+        return (self.vars[f"C{ch}:MODE"].get().strip() != "PWM"
+                or self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
+                == PWM_CARRIER)
+
+    def check_pwm(self, ch):
+        """Say so, once, each time the panel newly asks for PWM on a carrier
+        that cannot carry it.
+
+        Called from both sides of the pair, since either the mode or the wave
+        type can be the half that just changed, and only on the way into the
+        bad state - otherwise every later keystroke on the channel would raise
+        the same box again.
+        """
+        bad = not self.pwm_ok(ch)
+        if bad and not self.pwm_bad[ch] and not self.loading:
+            wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip() or "(none)"
+            messagebox.showerror("PWM carrier",
+                                 "The carrier of PWM can only be pulse")
+            self.log(f"CH{ch}: PWM needs a {PWM_CARRIER} carrier, "
+                     f"and the wave type is {wvtp}.")
+        self.pwm_bad[ch] = bad
 
     def mode_key(self, ch, slot):
         """SCPI key the given mode slot currently stands for, or None."""
@@ -1859,14 +2053,23 @@ class App:
         edit not applied yet - unless overwrite is set, which is the case after
         an Apply, when the generator is the authority on what took effect."""
         values = self.flatten(ch, blocks)
-        # The mode row is relabelled by the mode itself, so that has to be set
-        # before its slots or the slots land under the wrong labels.
-        for key in (f"C{ch}:BSWV:WVTP", f"C{ch}:MODE"):
-            if overwrite or not self.edited(key):
-                self.vars[key].set(values[key])
-            self.inst_vals[key] = values[key]
-        self.on_wave_type(ch)
-        self.on_mode(ch)
+        # What the generator reports is not an edit, so neither the mode row's
+        # carry-over nor the PWM complaint should fire while it lands.
+        self.loading = True
+        try:
+            # The mode row is relabelled by the mode itself, so that has to be
+            # set before its slots or the slots land under the wrong labels.
+            for key in (f"C{ch}:BSWV:WVTP", f"C{ch}:MODE"):
+                if overwrite or not self.edited(key):
+                    self.vars[key].set(values[key])
+                self.inst_vals[key] = values[key]
+            self.on_wave_type(ch)
+            self.on_mode(ch)
+        finally:
+            self.loading = False
+        # Whatever the generator turned out to be set to is the new baseline for
+        # the complaint, so a panel read back in a bad state says so once.
+        self.pwm_bad[ch] = not self.pwm_ok(ch)
 
         kept = 0
         done = (f"C{ch}:BSWV:WVTP", f"C{ch}:MODE")
@@ -1987,6 +2190,19 @@ class App:
         plan = {ch: b for ch, b in plan.items() if b}
         if not plan:
             self.log("No changes to apply.")
+            return
+        # The generator takes PWM on a sine without complaint and then does
+        # something else with it, so the refusal has to happen here. Only the
+        # channels actually sending a mode block are in the way.
+        bad = [ch for ch, blocks in plan.items()
+               if "MODE" in blocks and not self.pwm_ok(ch)]
+        if bad:
+            messagebox.showerror("PWM carrier",
+                                 "The carrier of PWM can only be pulse")
+            self.log("Apply cancelled: "
+                     + " and ".join(f"CH{c}" for c in bad)
+                     + " asks for PWM on a carrier that is not "
+                     + f"{PWM_CARRIER}.")
             return
         # Changing the waveform under a channel that is already driving
         # something is a real change to the experiment, not just to the panel.
@@ -2375,6 +2591,46 @@ class App:
                 return n_points / rate
         return self.channel_period(ch)
 
+    def show_alias_note(self, wanted, target, pending, span):
+        """Name the traces the preview cannot draw faithfully, beside the
+        switches that turn them on.
+
+        The window is set by the slowest thing on it, so a fast carrier under
+        slow modulation - or a long arb, or a pulse with edges in nanoseconds -
+        can come down to a couple of points per cycle, and what is drawn is
+        then an alias rather than the shape the generator will put out.
+        """
+        if getattr(self, "alias_note", None) is None:
+            return
+        bad = []
+        for ch in wanted:
+            wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
+            vals = {key: self.vars[f"C{ch}:BSWV:{key}"].get().strip()
+                    for key, _, _ in WAVE_PARAMS}
+            name = self.vars[f"C{ch}:ARWV:NAME"].get().strip()
+            arb = self.known_waves.get(name) if wvtp == "ARB" else None
+            mode, mod = self.channel_mode(ch)
+            n = preview_points(span, wvtp, vals, mode, mod, arb)
+            if preview_aliasing(span, n, wvtp, vals, mode, mod, arb):
+                bad.append(f"CH{ch}")
+        if pending is not None:
+            # Drawn through the target channel's settings but from its own
+            # record, so it can be the coarse one on a plot whose channels are
+            # both fine.
+            vals = {key: self.vars[f"C{target}:BSWV:{key}"].get().strip()
+                    for key, _, _ in WAVE_PARAMS}
+            mode, mod = self.channel_mode(target)
+            n = preview_points(span, "ARB", vals, mode, mod, pending)
+            if preview_aliasing(span, n, "ARB", vals, mode, mod, pending):
+                bad.append("pending")
+
+        text = ""
+        if bad:
+            named = (bad[0] if len(bad) == 1
+                     else ", ".join(bad[:-1]) + " and " + bad[-1])
+            text = f"{named} may be aliasing"
+        self.alias_note.configure(text=text)
+
     def draw_preview(self):
         """Every enabled trace on one shared time axis.
 
@@ -2419,6 +2675,7 @@ class App:
             return
 
         span = 2.0 * max(periods)
+        self.show_alias_note(wanted, target, pending, span)
         # Two y axes only earn their keep when there are two channels to
         # separate; with one trace it is just a duplicated scale.
         split = self.split_y.get() and len(wanted) == 2

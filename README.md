@@ -67,7 +67,19 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
 - **Apply sends only what you edited.** Untouched settings are not rewritten,
   which matters on a channel that is currently driving something.
 - **Mode** is one row because the instrument allows only one of modulation, sweep
-  and burst at a time. Picking a mode relabels the parameter slots beneath it.
+  and burst at a time. Picking a mode relabels the parameter slots beneath it,
+  and **moves the values to wherever the new mode keeps them**. A value survives
+  the switch only when the new mode has the same parameter, so going from ASK
+  (key freq, source) to FSK (key freq, hop freq, source) keeps the key frequency
+  where it is, moves the source down a slot and leaves the hop frequency empty
+  for you to fill in. Anything with no counterpart in the new mode is cleared
+  rather than left sitting under a label that does not describe it.
+- **PWM needs a PULSE carrier.** It is the one mode the wave type constrains -
+  there is nothing for PWM to widen otherwise - and the generator accepts the
+  combination without complaint and then does something else with it. Asking for
+  PWM on any other wave type, or changing the wave type away from `PULSE` while
+  PWM is selected, raises *"The carrier of PWM can only be pulse"*, and Apply
+  refuses to send it.
 - **Preview** draws what Apply *would* produce, computed locally from the panel -
   not read back from the generator, which cannot report its samples. An arb is
   drawn from the local copy kept in `Waveforms/`, so anything uploaded through
@@ -366,6 +378,39 @@ sweep time, the burst period. Two carrier cycles of a 10 kHz tone under 100 Hz A
 is a flat sine with no modulation visible at all, which is exactly how the preview
 managed to look plausible while ignoring the whole modulation row.
 
+### How finely it is drawn
+
+The window is sized by the modulating envelope, which is the only way to see the
+modulation at all - but that puts the carrier under whatever point budget is left
+over. A 10 kHz tone under 10 Hz keying is 2000 carrier cycles inside one picture,
+and a fixed budget across it draws an alias: a shape the generator will not
+produce. So the point count is chosen per trace from what is in it - the carrier,
+its deviation, a pulse edge, an arb's stored points - between a floor of 2000
+that keeps a plain tone smooth and a ceiling of 20000 that keeps the redraw on
+every keystroke responsive.
+
+Where the trace is keyed on and off, the sample grid is also **landed exactly on
+the keying edges**. A gate that switches between two samples slopes into its off
+state and leaves it a sample late, which on ASK - the one mode whose off state is
+a flat zero - reads as points missing from the zero rather than as a square edge.
+
+When even the ceiling is not enough, **`CH1 may be aliasing`** appears in orange
+beside the trace switches, naming whichever traces are affected - `CH1`, `CH2`,
+`pending`, or several - rather than letting the picture pass for the truth. It
+lives with the switches instead of in the log because it changes on every
+keystroke, which is exactly what a log should not do, and it clears itself the
+moment the settings come back within budget.
+
+What it means: the shape on screen has detail rounded off, and past a couple of
+points per cycle it is not the shape at all. Reach for the numbers on the panel
+rather than the picture - or narrow the window by slowing the carrier or
+speeding up the modulation until the notice goes away.
+
+Because all the traces share one time axis, **the notice can be about a setting
+on the other channel**: a 1 Hz keying rate on CH1 stretches the window to two
+seconds, and a perfectly ordinary 2 kHz CH2 goes under with it. Un-ticking the
+slow trace shrinks the window and clears both.
+
 Two things are **not** modelled, and say so on the plot rather than drawing a
 guess: a **gated burst**, which follows an external signal this app knows nothing
 about, and an **arb with no local copy**, whose samples the generator will not
@@ -484,6 +529,8 @@ drive the instrument from your own scripts.
 
 The carrier also constrains what is legal: PWM needs a PULSE carrier, and the rest
 need SINE/SQUARE/RAMP/ARB. Ask for AM on a pulse carrier and you quietly get PWM.
+The PWM half of that is checked in the panel - see [The panel](#the-panel) - since
+the generator will not raise it for you.
 
 ## Reading replies
 
