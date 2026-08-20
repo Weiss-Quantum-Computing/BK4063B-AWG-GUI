@@ -417,6 +417,65 @@ def build_waveform(shape, n_points, values):
     return y
 
 
+def parse_floats(text):
+    """A comma, semicolon or space separated list of numbers, or None if empty."""
+    out = []
+    for token in re.split(r"[,;\s]+", str(text or "").strip()):
+        if token:
+            out.append(float(token))
+    return out or None
+
+
+def pulse_train(element, count, period=2.0, lead=0.0, baseline=0.0,
+                amplitudes=None, gaps=None):
+    """Repeat one waveform into a train of `count` copies.
+
+    Spacings are in multiples of the element's own length rather than in
+    seconds, because the element has no duration until a sample clock is chosen
+    - expressed this way the train keeps its shape whatever rate it is played
+    at, and the panel converts to time for display.
+
+    period      pulse start to pulse start, so 1.0 is back to back and 2.0
+                leaves a gap as long as the pulse. Clamped at 1.0: a shorter
+                period would need pulses to overlap and sum, which is a
+                different thing from a train.
+    lead        dead time before the first pulse.
+    baseline    the level held between pulses.
+    amplitudes  optional per-pulse scale factors, cycled if shorter than count.
+                A list like "1, 0.5, 0.25" is a pulse-area scan in one record.
+    gaps        optional per-pulse gaps, cycled, overriding `period`. This is
+                what makes an unequally spaced sequence - two pulses split by a
+                settable free-evolution time, say.
+
+    The trailing gap is part of the record, so the arb loops into itself with
+    the spacing intact instead of running the last pulse into the first.
+    """
+    element = np.asarray(element, dtype=np.float64).ravel()
+    if element.size < 1:
+        raise ValueError("no waveform to repeat")
+    count = int(count)
+    if count < 1:
+        raise ValueError("need at least one pulse")
+
+    n = element.size
+    lead_n = max(int(round(max(lead, 0.0) * n)), 0)
+    if gaps:
+        gap_n = [max(int(round(g * n)), 0) for g in gaps]
+    else:
+        gap_n = [max(int(round(max(period, 1.0) * n)), n) - n]
+
+    pieces = []
+    if lead_n:
+        pieces.append(np.full(lead_n, baseline))
+    for i in range(count):
+        scale = amplitudes[i % len(amplitudes)] if amplitudes else 1.0
+        pieces.append(element * scale)
+        after = gap_n[i % len(gap_n)]
+        if after:
+            pieces.append(np.full(after, baseline))
+    return np.concatenate(pieces)
+
+
 def parse_pasted(text):
     """Read typed or pasted numbers into (2-D array, column names or None).
 
@@ -1037,6 +1096,8 @@ class App:
         self.busy = False
         self.arb_samples = None       # samples loaded from disk, not yet uploaded
         self.arb_table = None         # every column of that file, for the picker
+        self.arb_element = None       # the last built/loaded/pasted waveform,
+                                      # kept so a train is never built on a train
         self.known_waves = cache_load()   # name -> samples, from earlier sessions
         self.device_waves = []        # what the generator last said it holds
         self.arb_source = ""
@@ -1095,6 +1156,7 @@ class App:
         # already fill the height on a laptop screen.
         self.build_preview(right, pad)
         self.build_builder(right, pad)
+        self.build_train(right, pad)
         self.build_arb(right, pad)
 
         # --- log
@@ -1349,6 +1411,78 @@ class App:
         ttk.Button(row, text="Use these values", command=use).pack(side="left")
         ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
         txt.focus_set()
+
+    def build_train(self, parent, pad):
+        f = ttk.LabelFrame(parent, text="Pulse train (repeats the pending waveform)")
+        f.pack(fill="x", **pad)
+
+        r1 = ttk.Frame(f)
+        r1.pack(fill="x", padx=6, pady=(6, 2))
+        self.train_vars = {}
+        for label, key, default, width in (
+                ("Pulses:", "count", "5", 6),
+                ("Period (x pulse):", "period", "2", 6),
+                ("Lead-in (x pulse):", "lead", "0", 6),
+                ("Baseline:", "baseline", "0", 6)):
+            ttk.Label(r1, text=label).pack(side="left", padx=(0, 3))
+            var = tk.StringVar(value=default)
+            self.train_vars[key] = var
+            ttk.Entry(r1, textvariable=var, width=width).pack(side="left", padx=(0, 8))
+        ttk.Button(r1, text="Make train", command=self.do_train).pack(side="left")
+
+        r2 = ttk.Frame(f)
+        r2.pack(fill="x", padx=6, pady=(2, 6))
+        for label, key, width in (("Per-pulse amplitude:", "amplitudes", 16),
+                                  ("Gaps (x pulse):", "gaps", 16)):
+            ttk.Label(r2, text=label).pack(side="left", padx=(0, 3))
+            var = tk.StringVar()
+            self.train_vars[key] = var
+            ttk.Entry(r2, textvariable=var, width=width).pack(side="left", padx=(0, 8))
+        self.train_info = ttk.Label(r2, text="", foreground="#666")
+        self.train_info.pack(side="left")
+
+    def do_train(self):
+        """Repeat the element into a train. Always rebuilt from the last thing
+        built, loaded or pasted, so changing the count and pressing again does
+        not make a train of the previous train."""
+        if self.arb_element is None:
+            self.log("Nothing to repeat - build, load or paste a waveform first.")
+            return
+        get = lambda k: self.train_vars[k].get()
+        try:
+            count = int(float(get("count")))
+            out = pulse_train(self.arb_element, count,
+                              period=float(get("period") or 2),
+                              lead=float(get("lead") or 0),
+                              baseline=float(get("baseline") or 0),
+                              amplitudes=parse_floats(get("amplitudes")),
+                              gaps=parse_floats(get("gaps")))
+        except Exception as exc:
+            self.log(f"Could not make the train: {exc}")
+            messagebox.showerror("Cannot make pulse train", str(exc))
+            return
+
+        element_n = self.arb_element.size
+        self.arb_samples = out
+        self.arb_table = out.reshape(-1, 1)
+        self.arb_source = f"train of {count} x {element_n} pts"
+        self.arb_col_box.configure(values=["column 1"], state="disabled")
+        self.arb_col.set("column 1")
+        self.show_pending.set(True)
+        self.arb_info.configure(text=f"{self.arb_source} = {out.size} pts",
+                                foreground="#000")
+
+        # Say what it comes to in real time on the channel it is aimed at, since
+        # the train is specified in pulse lengths and the bench thinks in
+        # seconds.
+        target = int(self.arb_ch.get())
+        span = self.pending_period(target, out.size)
+        self.train_info.configure(
+            text=f"{out.size} pts, {span * 1e3:.4g} ms on CH{target}")
+        self.log(f"Pulse train: {count} x {element_n} pts -> {out.size} pts "
+                 f"({span * 1e3:.4g} ms at the CH{target} clock)")
+        self.set_busy(self.busy)
+        self.draw_preview()
 
     def build_arb(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Upload arbitrary waveform")
@@ -1989,6 +2123,7 @@ class App:
             index = 0
         data = np.asarray(self.arb_table[:, index], dtype=np.float64).ravel()
         self.arb_samples = data
+        self.arb_element = data
 
         note = f"{os.path.basename(self.arb_source)} - {data.size} pts"
         if self.arb_table.shape[1] > 1:

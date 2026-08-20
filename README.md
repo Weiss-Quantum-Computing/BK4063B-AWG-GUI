@@ -131,6 +131,44 @@ blank lines and `#` comments are skipped, and multi-column input gets the same
 column picker as a file. Ragged rows are rejected rather than silently
 misaligned.
 
+## Pulse trains
+
+**Pulse train** repeats whatever is pending - a built shape, a loaded file or
+pasted values - into one record holding the whole train, then Upload sends it as
+a single arb.
+
+![Uniform, amplitude-scanned and unequally spaced trains](Waveforms/pulse_trains.png)
+
+| Field | Meaning |
+|-------|---------|
+| Pulses | how many copies |
+| Period (x pulse) | pulse start to pulse start, in multiples of the element's own length. `1` is back to back; `3` gives a gap twice the pulse |
+| Lead-in (x pulse) | dead time before the first pulse |
+| Baseline | the level held between pulses |
+| Per-pulse amplitude | optional comma list of scale factors, cycled |
+| Gaps (x pulse) | optional comma list of gaps, cycled, overriding Period |
+
+Spacings are in **multiples of the element's length**, not seconds, because the
+element has no duration until a sample clock is chosen. Specified this way a
+train keeps its shape at any playback rate, and the panel shows what it comes to
+in milliseconds on the channel it is aimed at. Period is clamped at `1`: a
+shorter one would need pulses to overlap and sum, which is a different operation
+from repeating.
+
+The trailing gap is part of the record, so the arb loops into itself with the
+spacing intact instead of butting the last pulse against the first.
+
+Two fields earn their keep on an AMO bench:
+
+- **Per-pulse amplitude** puts a pulse-area scan in a single record - `1, 0.7,
+  0.4` gives three pulses at descending area, no reprogramming between shots.
+- **Gaps** makes an unequally spaced sequence. Two pulses with `Gaps` set to the
+  free-evolution time is a Ramsey sequence; a list cycles for anything longer.
+
+**Make train** always rebuilds from the last thing you built, loaded or pasted,
+never from the previous train - so changing the count and pressing again does
+what you meant rather than squaring the record.
+
 ## Uploading an arbitrary waveform
 
 **Load file...**, pick the column if you are asked, set a name and a channel, then
