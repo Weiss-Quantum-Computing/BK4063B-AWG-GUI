@@ -752,7 +752,26 @@ def _numget(source):
     return num
 
 
-def preview_period(wvtp, vals, mode="Off", mod=None):
+def _repeat_freq(wvtp, freq, arb_period):
+    """How often the record on screen actually repeats, in hertz.
+
+    An arb repeats at the channel's FRQ only while the record loaded on the
+    channel is the one being drawn. Under TrueArb the points come out at the
+    sample clock, so a record of a different length repeats at rate / points -
+    and a record that has not been sent yet is exactly the case where the
+    caller knows that length and FRQ still describes the old one. So an
+    `arb_period` handed in for an arb is the repeat time, and FRQ is stale.
+
+    DDS resamples whatever it holds into one period, so there the length says
+    nothing about the rate and the channel's frequency stands: callers pass no
+    `arb_period` for it.
+    """
+    if wvtp == "ARB" and arb_period and arb_period > 0:
+        return 1.0 / arb_period
+    return freq
+
+
+def preview_period(wvtp, vals, mode="Off", mod=None, arb_period=None):
     """The repeat time worth drawing two of.
 
     With a mode running that is the envelope, not the carrier: two carrier
@@ -761,7 +780,7 @@ def preview_period(wvtp, vals, mode="Off", mod=None):
     the whole modulation row.
     """
     num, mnum = _numget(vals), _numget(mod or {})
-    freq = num("FRQ", 1000.0)
+    freq = _repeat_freq(wvtp, num("FRQ", 1000.0), arb_period)
     carrier = 1.0 / (freq if freq > 0 else 1000.0)
     if mode == "Sweep":
         return max(mnum("TIME", 1.0), 1e-9)
@@ -797,7 +816,8 @@ DENSITY_LIMITS = {"cycle": 12.0, "pulse": 8.0, "edge": 4.0,
                   "stored point": 1.0}
 
 
-def preview_features(wvtp, vals, mode="Off", mod=None, arb=None):
+def preview_features(wvtp, vals, mode="Off", mod=None, arb=None,
+                     arb_period=None):
     """Everything in the trace that has to be resolved, as
     (per second, what one of them is called, points wanted each).
 
@@ -805,11 +825,16 @@ def preview_features(wvtp, vals, mode="Off", mod=None, arb=None):
     *finely* is a different question with a different answer: the window
     follows the modulating envelope while the detail follows the carrier, its
     deviation, a pulse edge, or the stored points of an arb.
+
+    `arb_period` is the arb's own repeat time where the caller knows it; its
+    stored points then come out at that rate rather than at FRQ, which is what
+    the trace is drawn at.
     """
     num, mnum = _numget(vals), _numget(mod or {})
     freq = num("FRQ", 1000.0)
     if freq <= 0:
         freq = 1000.0
+    freq = _repeat_freq(wvtp, freq, arb_period)
 
     rate = freq
     if mode == "FM":
@@ -848,14 +873,15 @@ def _key_rate(mode, mod):
     return 0.0
 
 
-def preview_points(span, wvtp, vals, mode="Off", mod=None, arb=None):
+def preview_points(span, wvtp, vals, mode="Off", mod=None, arb=None,
+                   arb_period=None):
     """How many samples to draw `span` seconds with.
 
     Deterministic, so the plot and the warning about the plot agree without
     having to pass the count between them.
     """
     want = max(per * span * rate for rate, _, per
-               in preview_features(wvtp, vals, mode, mod, arb))
+               in preview_features(wvtp, vals, mode, mod, arb, arb_period))
     n = int(min(max(PREVIEW_MIN_POINTS, want), PREVIEW_MAX_POINTS))
 
     # Land the grid exactly on the keying edges. A gate that switches between
@@ -868,7 +894,8 @@ def preview_points(span, wvtp, vals, mode="Off", mod=None, arb=None):
     return max(2, min(n, PREVIEW_MAX_POINTS))
 
 
-def preview_aliasing(span, n, wvtp, vals, mode="Off", mod=None, arb=None):
+def preview_aliasing(span, n, wvtp, vals, mode="Off", mod=None, arb=None,
+                     arb_period=None):
     """True when `n` points across `span` seconds cannot draw this faithfully.
 
     Asked of a whole trace rather than of one feature: the panel says which
@@ -878,22 +905,30 @@ def preview_aliasing(span, n, wvtp, vals, mode="Off", mod=None, arb=None):
     if span <= 0:
         return False
     return any(rate > 0 and n / (span * rate) < DENSITY_LIMITS.get(unit, 8.0)
-               for rate, unit, _ in preview_features(wvtp, vals, mode, mod, arb))
+               for rate, unit, _
+               in preview_features(wvtp, vals, mode, mod, arb, arb_period))
 
 
 def preview_curve(wvtp, vals, arb=None, periods=2.0, n=None, hold=True,
-                  period=None, span=None, mode="Off", mod=None, invert=False):
+                  period=None, span=None, mode="Off", mod=None, invert=False,
+                  arb_period=None):
     """What the panel currently describes, in volts against seconds.
 
     Computed here rather than read back from the generator: the point is to show
     what Apply would produce, before it is applied. `hold` picks how an arb gets
     from one stored point to the next - held under TrueArb, ramped under DDS.
 
-    `period` overrides the repeat time that would otherwise come from FRQ, and
-    `span` sets how much time to draw. Both exist so several traces can be put
-    on one shared time axis: two channels running at different frequencies are
+    `period` sizes the window that would otherwise come from FRQ, and `span`
+    sets how much time to draw. Both exist so several traces can be put on one
+    shared time axis: two channels running at different frequencies are
     simultaneous in the real world, and drawing each over its own private window
     would imply they line up when they do not.
+
+    `arb_period` is a different thing and the two are not interchangeable: it
+    says how often the *record* repeats, which is what the trace is drawn at.
+    Under a mode `period` is the envelope, so feeding that to the carrier would
+    draw a 1 kHz arb under 100 Hz AM as a 100 Hz one. See `_repeat_freq` for
+    when a caller has an `arb_period` to give.
 
     `n` is the number of samples to draw with; left out, it is chosen from
     what the trace contains, because the window is sized by the envelope and a
@@ -913,13 +948,17 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=None, hold=True,
     freq = num("FRQ", 1000.0)
     if freq <= 0:
         freq = 1000.0
+    # Substituted before f_inst is built, so the one accumulator below carries
+    # the record's real repeat rate and FM, FSK and a sweep still deviate about
+    # it rather than about a frequency the record is not coming out at.
+    freq = _repeat_freq(wvtp, freq, arb_period)
 
     if period is None:
-        period = preview_period(wvtp, vals, mode, mod)
+        period = preview_period(wvtp, vals, mode, mod, arb_period)
     if span is None:
         span = periods * period
     if n is None:
-        n = preview_points(span, wvtp, vals, mode, mod, arb)
+        n = preview_points(span, wvtp, vals, mode, mod, arb, arb_period)
     t = np.linspace(0.0, span, n)
     dt = t[1] - t[0] if n > 1 else 1.0
 
@@ -2574,22 +2613,30 @@ class App:
         return preview_period(self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper(),
                               vals, mode, mod)
 
-    def pending_period(self, ch, n_points):
-        """How long the pending record would last on the channel it is aimed at.
+    def pending_arb_period(self, ch, n_points):
+        """How often a record of `n_points` would repeat on this channel, or
+        None when its length is not what sets that.
 
-        Under TrueArb that is points / sample rate, which is knowable exactly
-        and is *not* the channel's present frequency - loading a record of a
-        different length changes the frequency. Under DDS the record is one
-        period whatever its length, so the channel's frequency stands.
+        Under TrueArb it is points / sample rate, which is knowable exactly and
+        is *not* the channel's present frequency - loading a record of a
+        different length is what changes that frequency, so FRQ is still
+        describing the record being replaced. Under DDS the record is resampled
+        into one period whatever its length, so its length says nothing and the
+        channel's frequency stands: None, and the caller falls back to it.
         """
-        if self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB":
-            try:
-                rate = float(self.vars[f"C{ch}:SRATE:VALUE"].get().strip() or 0)
-            except ValueError:
-                rate = 0.0
-            if rate > 0:
-                return n_points / rate
-        return self.channel_period(ch)
+        if self.vars[f"C{ch}:SRATE:MODE"].get().strip() != "TARB":
+            return None
+        try:
+            rate = float(self.vars[f"C{ch}:SRATE:VALUE"].get().strip() or 0)
+        except ValueError:
+            return None
+        return n_points / rate if rate > 0 else None
+
+    def pending_period(self, ch, n_points):
+        """How long a window the pending record wants on the channel it is
+        aimed at: its own repeat time where that is knowable, otherwise the
+        channel's."""
+        return self.pending_arb_period(ch, n_points) or self.channel_period(ch)
 
     def show_alias_note(self, wanted, target, pending, span):
         """Name the traces the preview cannot draw faithfully, beside the
@@ -2620,8 +2667,11 @@ class App:
             vals = {key: self.vars[f"C{target}:BSWV:{key}"].get().strip()
                     for key, _, _ in WAVE_PARAMS}
             mode, mod = self.channel_mode(target)
-            n = preview_points(span, "ARB", vals, mode, mod, pending)
-            if preview_aliasing(span, n, "ARB", vals, mode, mod, pending):
+            arb_period = self.pending_arb_period(target, pending.size)
+            n = preview_points(span, "ARB", vals, mode, mod, pending,
+                               arb_period)
+            if preview_aliasing(span, n, "ARB", vals, mode, mod, pending,
+                                arb_period):
                 bad.append("pending")
 
         text = ""
@@ -2698,10 +2748,14 @@ class App:
                     for key, _, _ in WAVE_PARAMS}
             hold = self.arb_style(target)[0] == "steps-post"
             mode, mod = self.channel_mode(target)
+            # arb_period rather than period: what times an arb is how often
+            # the record repeats, and the window is already fixed by span. A
+            # period passed here would be read by nothing, which is how this
+            # trace came to be drawn at the channel's stale frequency.
             curve = preview_curve(
                 "ARB", vals, arb=pending, hold=hold, span=span, mode=mode, mod=mod,
                 invert=self.vars[f"C{target}:OUTP:PLRT"].get().strip() == "INVT",
-                period=self.pending_period(target, pending.size))
+                arb_period=self.pending_arb_period(target, pending.size))
             if curve is not None:
                 t, v = curve[:2]
                 handles += axis.plot(
