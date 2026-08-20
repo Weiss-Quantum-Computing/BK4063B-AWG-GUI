@@ -64,6 +64,25 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
 - **`*` markers** flag a cell you have edited but not applied yet, and the status
   line beside the buttons counts them. It reads `in sync (hh:mm:ss)` when the
   panel matches the generator.
+- **Yellow-tinted cells** hold a value that follows from other settings rather
+  than one that was set. Two ways that happens.
+
+  The first is a pair the generator keeps in step. Under **TrueArb** the record
+  clocks out point by point, so `freq = Sa/s / points` - and the point count
+  belongs to the waveform, not to the panel. That leaves `Freq (Hz)` and `Sa/s`
+  as one setting seen two ways, and **the tint follows whichever you did not
+  type in**: set a rate and the frequency is the arithmetic, type a frequency
+  and the rate becomes the arithmetic instead. `Sa/s` drives until you say
+  otherwise, since that is what a TrueArb record is actually clocked by. See
+  [Why the frequency moves when you change
+  waveform](#why-the-frequency-moves-when-you-change-waveform). Under DDS
+  neither is tinted - the record is one period whatever its length, so the
+  frequency really is a setting.
+
+  The second is a value this app worked out, which is what the
+  [sequence](#sequences) builder does when it puts the clock a timed record
+  needs onto the target channel. Typing in one of those takes the tint off:
+  from then on the value is yours.
 - **Apply sends only what you edited.** Untouched settings are not rewritten,
   which matters on a channel that is currently driving something.
 - **Mode** is one row because the instrument allows only one of modulation, sweep
@@ -432,11 +451,13 @@ Three traces, each switched on or off by its own checkbox:
 |-------|--------|-------|
 | CH1 | blue | solid |
 | CH2 | red | solid |
-| pending | colour of the channel it is aimed at | dashed |
+| pending | a paler shade of the channel it is aimed at | dashed |
 
-The pending waveform takes the colour of the **to CH** channel in the upload row,
+The pending waveform takes a **paler shade** of the **to CH** channel's colour,
 so changing that target recolours it - it is drawn as it would come out of the
-channel it is about to be sent to, not as an abstract shape. Each trace is
+channel it is about to be sent to, not as an abstract shape. Paler rather than
+the same colour dashed, because on a busy plot the same blue twice reads as one
+trace drawn oddly rather than as two different things. Each trace is
 labelled with its wave type, the arb name where there is one, and whether the
 clock is holding or interpolating.
 
@@ -544,6 +565,24 @@ scaled to its own trace and coloured to match:
 Same two signals both times - 0.6 Vpp on CH1 against 8 Vpp on CH2. The pending
 trace follows whichever axis its target channel is on. The option is ignored when
 only one channel is displayed, since a second copy of one scale helps nobody.
+
+### separate time axes
+
+All three traces share one window by default, and that is the honest picture:
+the channels are simultaneous on the bench. But a 10 Hz ramp beside a 1 MHz tone
+sets the window from the ramp, and the tone becomes a solid band - correct, and
+useless.
+
+Ticking **separate time axes** gives each channel its own panel, framed by its
+own period, with the pending trace joining the panel of the channel it is aimed
+at. What you gain is being able to read both; what you give up is the shared
+clock, so nothing about where one trace sits relative to the other means
+anything any more. The plot area grows to fit the extra panel.
+
+**separate Y axes** is ignored while this is on - a panel each already comes with
+a scale each. The [aliasing notice](#how-finely-it-is-drawn) follows the split
+too: a channel is judged against the window of its own panel, so the notice that
+appeared because the *other* channel was slow will clear.
 
 ### Held or interpolated - the clock decides
 

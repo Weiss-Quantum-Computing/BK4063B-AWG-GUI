@@ -61,6 +61,23 @@ CHANNELS = (1, 2)
 # One colour per channel, used for the trace, the checkbox and the split
 # y axis, so a glance at any of them identifies the others.
 CH_COLOUR = {1: "#1f77b4", 2: "#d62728"}      # blue, red
+
+
+def _lighten(colour, amount):
+    """A paler version of a hex colour, mixed towards white."""
+    red, green, blue = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
+    mix = [int(round(c + (255 - c) * amount)) for c in (red, green, blue)]
+    return "#%02x%02x%02x" % tuple(mix)
+
+
+# The pending trace is the channel it is aimed at, but not yet: a paler shade
+# of that channel's colour says both at once, where the same colour dashed left
+# it looking like the channel's own trace drawn twice.
+PENDING_COLOUR = {ch: _lighten(colour, 0.42) for ch, colour in CH_COLOUR.items()}
+
+# A value the panel worked out rather than one that was set. Light enough to
+# read black text through, since it sits behind an entry box.
+COMPUTED_BG = "#fdf3b4"
 WAVE_TYPES = ("SINE", "SQUARE", "RAMP", "PULSE", "NOISE", "DC", "ARB")
 # The front panel only offers these two, so they are what the dropdown shows.
 # The remote interface will actually take anything from 50 ohm to 100k (49 gets
@@ -1528,6 +1545,10 @@ class App:
         self.widgets = {}             # key -> the entry/combobox itself
         self.natural = {}             # key -> state to restore when re-enabled
         self.arb_labels = {}          # key -> its caption, for greying out
+        self.halos = {}               # key -> the frame behind it, for the tint
+        self.halo_off = None          # whatever Tk's default frame colour is
+        self.computed = set()         # keys this app worked out and filled in
+        self.driver = {}              # linked group -> the cell now driving it
         self.out_state = {ch: None for ch in CHANNELS}
 
         # The mode row's boxes are shared by every mode, so what each one means
@@ -1590,6 +1611,14 @@ class App:
         self.sync = ttk.Label(bar, text="not read yet", foreground="#666")
         self.sync.pack(side="left", padx=6)
 
+        hint = ttk.Frame(left)
+        hint.pack(fill="x", padx=8)
+        tk.Label(hint, text="   ", bg=COMPUTED_BG, relief="solid",
+                 borderwidth=1).pack(side="left")
+        ttk.Label(hint, foreground="#666",
+                  text=" computed from other settings, not set directly"
+                  ).pack(side="left", padx=(4, 0))
+
         self.build_setups(left, pad)
         self.build_memory(left, pad)
         # The waveform tools sit under the preview rather than in the left
@@ -1624,19 +1653,29 @@ class App:
         holder = ttk.Frame(parent)
         holder.grid(row=row, column=col, sticky="w", padx=2, pady=1)
         var = tk.StringVar()
+        # A plain tk.Frame behind the widget, showing two pixels all the way
+        # round. That is the tint for a computed value: the vista theme ignores
+        # a ttk field background outright, and swapping in a tk.Entry for the
+        # cells that need one would leave the panel with two kinds of box. The
+        # frame is always there, so turning the tint on shifts no layout.
+        halo = tk.Frame(holder)
+        halo.pack(side="left")
+        if self.halo_off is None:
+            self.halo_off = halo.cget("bg")
         # None -> plain entry. A list of choices -> fixed dropdown. An empty
         # tuple -> dropdown that is also typeable, for the arb name, whose
         # suggestions are filled in from the generator once it is read.
         if choices is not None:
-            w = ttk.Combobox(holder, textvariable=var, values=list(choices),
+            w = ttk.Combobox(halo, textvariable=var, values=list(choices),
                              width=max(4, width - 3),
                              state="readonly" if choices else "normal")
         else:
-            w = ttk.Entry(holder, textvariable=var, width=width)
-        w.pack(side="left")
+            w = ttk.Entry(halo, textvariable=var, width=width)
+        w.pack(padx=2, pady=2)
         mark = ttk.Label(holder, text=" ", width=1, foreground="#c60")
         mark.pack(side="left")
 
+        self.halos[key] = halo
         self.vars[key] = var
         self.marks[key] = mark
         self.widgets[key] = w
@@ -2099,10 +2138,15 @@ class App:
         ch = int(self.arb_ch.get())
         # Wave type first: the sample-rate cells are greyed out under any other
         # type, and a greyed cell is not collected for Apply.
-        for key, value in ((f"C{ch}:BSWV:WVTP", "ARB"),
-                           (f"C{ch}:SRATE:MODE", "TARB"),
-                           (f"C{ch}:SRATE:VALUE", f"{rate:.10g}")):
+        cells = ((f"C{ch}:BSWV:WVTP", "ARB"), (f"C{ch}:SRATE:MODE", "TARB"),
+                 (f"C{ch}:SRATE:VALUE", f"{rate:.10g}"))
+        for key, value in cells:
             self.vars[key].set(value)
+        # Marked afterwards, not as each one is written: setting a var runs
+        # on_edit, which clears the mark on the assumption a write is somebody
+        # typing.
+        self.computed.update(key for key, _ in cells)
+        self.refresh_marks()
         self.log(f"  CH{ch} panel set to ARB / TrueArb / {rate:.10g} Sa/s "
                  "- not applied yet")
 
@@ -2405,12 +2449,9 @@ class App:
             self.canvas = None
             return
         self.fig = Figure(figsize=(5.6, 3.0), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        # A second y axis made once and hidden when not wanted: building a fresh
-        # twinx on every redraw would stack up axes for the life of the session.
-        self.ax2 = self.ax.twinx()
-        self.ax2.set_visible(False)
-        self.fig.subplots_adjust(left=0.14, right=0.86, top=0.90, bottom=0.18)
+        # Built on the first draw and rebuilt only when the layout changes -
+        # how many panels there are, and whether one of them is twinned.
+        self.axes, self.ax, self.ax2, self.axes_key = [], None, None, None
         self.canvas = FigureCanvasTkAgg(self.fig, master=f)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
 
@@ -2438,6 +2479,9 @@ class App:
         self.split_y = tk.BooleanVar(value=False)
         ttk.Checkbutton(r, text="separate Y axes", variable=self.split_y,
                         command=self.draw_preview).pack(side="right")
+        self.split_t = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r, text="separate time axes", variable=self.split_t,
+                        command=self.draw_preview).pack(side="right", padx=(0, 10))
 
     # -- helpers -----------------------------------------------------------
 
@@ -2464,6 +2508,16 @@ class App:
         # through one would show a row that is part old mode and part new.
         if self.quiet:
             return
+        # A value the panel worked out stops being one the moment it is typed
+        # over, so the tint comes off at the first keystroke in the box.
+        self.computed.discard(key)
+        group = self.linked_group(key)
+        if group and not self.loading:
+            # Of two cells locked to each other, the one just typed in is the
+            # setting and the other becomes the arithmetic. Not while a read is
+            # landing: the generator reporting both is not a choice between
+            # them.
+            self.driver[group] = key
         self.refresh_marks()
         self.draw_preview()
 
@@ -2471,14 +2525,58 @@ class App:
         """True if the panel value differs from what the generator last said."""
         return self.vars[key].get().strip() != self.inst_vals[key]
 
+    def linked_group(self, key):
+        """The cells this one is locked to, or () when it stands alone.
+
+        Under TrueArb the record clocks out point by point, so `freq = rate /
+        points` - and the point count belongs to the waveform, not to the
+        panel. That leaves the frequency and the sample rate as one setting
+        seen two ways: set either and the generator works the other out. Which
+        of them is a setting and which is arithmetic is therefore not fixed,
+        it is whichever was typed in last.
+        """
+        for ch in CHANNELS:
+            group = (f"C{ch}:SRATE:VALUE", f"C{ch}:BSWV:FRQ")
+            if key not in group:
+                continue
+            live = (self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB"
+                    and self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
+                    == "ARB")
+            return group if live else ()
+        return ()
+
+    def is_computed(self, key):
+        """True when this cell shows arithmetic rather than a setting.
+
+        Two ways a number lands in a box without being typed there. It is the
+        far side of a pair the generator keeps in step - see `linked_group`.
+        Or this app worked it out, which is what the sequence builder does with
+        the clock a record specified in seconds needs to be played at.
+        """
+        if key in self.computed:
+            return True
+        group = self.linked_group(key)
+        # The sample rate drives until told otherwise: it is the setting a
+        # TrueArb record is actually clocked by, and the one the sequence
+        # builder fills in.
+        return bool(group) and key != self.driver.get(group, group[0])
+
     def refresh_marks(self):
         if not hasattr(self, "sync"):
             return          # still building the panel
         pending = 0
         for key, mark in self.marks.items():
+            live = str(self.widgets[key].cget("state")) != "disabled"
+            halo = self.halos.get(key)
+            if halo is not None:
+                # A greyed cell is not part of the current settings, so it is
+                # neither an edit nor a computed value - just what was left
+                # behind by the previous wave type.
+                halo.configure(bg=COMPUTED_BG if live and self.is_computed(key)
+                               else self.halo_off)
             # A disabled cell is not part of the current wave type, so whatever
             # is left in it is stale rather than an edit waiting to be applied.
-            if str(self.widgets[key].cget("state")) == "disabled":
+            if not live:
                 mark.configure(text=" ")
                 continue
             if self.edited(key):
@@ -2686,6 +2784,7 @@ class App:
         values = self.flatten(ch, blocks)
         # What the generator reports is not an edit, so neither the mode row's
         # carry-over nor the PWM complaint should fire while it lands.
+        kept = 0
         self.loading = True
         try:
             # The mode row is relabelled by the mode itself, so that has to be
@@ -2696,26 +2795,25 @@ class App:
                 self.inst_vals[key] = values[key]
             self.on_wave_type(ch)
             self.on_mode(ch)
+
+            done = (f"C{ch}:BSWV:WVTP", f"C{ch}:MODE")
+            for key, value in values.items():
+                # Exact keys, not a suffix test: "C1:SRATE:MODE" also ends in
+                # ":MODE", and matching it here left the Clock cell permanently
+                # blank because it was skipped by the loop that fills the panel.
+                if key in done:
+                    continue
+                was_edited = self.edited(key)
+                self.inst_vals[key] = value
+                if overwrite or not was_edited:
+                    self.vars[key].set(value)
+                elif self.vars[key].get().strip() != value:
+                    kept += 1
         finally:
             self.loading = False
         # Whatever the generator turned out to be set to is the new baseline for
         # the complaint, so a panel read back in a bad state says so once.
         self.pwm_bad[ch] = not self.pwm_ok(ch)
-
-        kept = 0
-        done = (f"C{ch}:BSWV:WVTP", f"C{ch}:MODE")
-        for key, value in values.items():
-            # Exact keys, not a suffix test: "C1:SRATE:MODE" also ends in
-            # ":MODE", and matching it here left the Clock cell permanently
-            # blank because it was skipped by the loop that fills the panel.
-            if key in done:
-                continue
-            was_edited = self.edited(key)
-            self.inst_vals[key] = value
-            if overwrite or not was_edited:
-                self.vars[key].set(value)
-            elif self.vars[key].get().strip() != value:
-                kept += 1
 
         self.show_lamp(ch, parse_reply(blocks.get("OUTP", "")).get("STATE"))
         if kept:
@@ -2975,8 +3073,6 @@ class App:
         note = f"{os.path.basename(self.arb_source)} - {data.size} pts"
         if self.arb_table.shape[1] > 1:
             note += f", col {index + 1}"
-        if data.size % 2:
-            note += " (odd count, last dropped)"
         self.arb_info.configure(text=note, foreground="#000")
         self.log(f"  using column {index + 1}: {data.size} pts, "
                  f"{data.min():g} to {data.max():g}")
@@ -3230,19 +3326,21 @@ class App:
         channel's."""
         return self.pending_arb_period(ch, n_points) or self.channel_period(ch)
 
-    def show_alias_note(self, wanted, target, pending, span):
+    def show_alias_note(self, spans, target, pending, pending_span):
         """Name the traces the preview cannot draw faithfully, beside the
         switches that turn them on.
 
-        The window is set by the slowest thing on it, so a fast carrier under
-        slow modulation - or a long arb, or a pulse with edges in nanoseconds -
-        can come down to a couple of points per cycle, and what is drawn is
-        then an alias rather than the shape the generator will put out.
+        The window is set by the slowest thing sharing it, so a fast carrier
+        under slow modulation - or a long arb, or a pulse with edges in
+        nanoseconds - can come down to a couple of points per cycle, and what
+        is drawn is then an alias rather than the shape the generator will put
+        out. `spans` is per channel, since with separate time axes a channel is
+        only framed by what shares its own panel.
         """
         if getattr(self, "alias_note", None) is None:
             return
         bad = []
-        for ch in wanted:
+        for ch, span in spans.items():
             wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
             vals = {key: self.vars[f"C{ch}:BSWV:{key}"].get().strip()
                     for key, _, _ in WAVE_PARAMS}
@@ -3260,10 +3358,10 @@ class App:
                     for key, _, _ in WAVE_PARAMS}
             mode, mod = self.channel_mode(target)
             arb_period = self.pending_arb_period(target, pending.size)
-            n = preview_points(span, "ARB", vals, mode, mod, pending,
+            n = preview_points(pending_span, "ARB", vals, mode, mod, pending,
                                arb_period)
-            if preview_aliasing(span, n, "ARB", vals, mode, mod, pending,
-                                arb_period):
+            if preview_aliasing(pending_span, n, "ARB", vals, mode, mod,
+                                pending, arb_period):
                 bad.append("pending")
 
         text = ""
@@ -3273,23 +3371,53 @@ class App:
             text = f"{named} may be aliasing"
         self.alias_note.configure(text=text)
 
-    def draw_preview(self):
-        """Every enabled trace on one shared time axis.
+    def preview_axes(self, panels, twin):
+        """The axes to draw on: `panels` stacked, the first optionally twinned.
 
-        Channels are drawn over a common window because they are simultaneous on
-        the bench; giving each its own window would imply an alignment that does
-        not exist. The pending waveform is drawn as it would come out of the
-        channel it is aimed at, in that channel's colour but dashed.
+        Rebuilt only when that shape changes. Clearing and re-adding on every
+        redraw would be simpler, but a twinx made fresh each time stacks up
+        axes for the life of the session - and a redraw happens on every
+        keystroke.
+        """
+        key = (panels, twin)
+        if key != self.axes_key:
+            self.fig.clf()
+            self.axes = list(self.fig.subplots(panels, 1, squeeze=False)[:, 0])
+            self.ax = self.axes[0]
+            self.ax2 = self.ax.twinx() if twin else None
+            # Stacked panels need room between them for a whole x axis each,
+            # and the figure has to grow or they end up two slivers.
+            self.fig.set_size_inches(5.6, 3.0 + 1.15 * (panels - 1))
+            self.fig.subplots_adjust(left=0.14, right=0.86, top=0.90,
+                                     bottom=0.18, hspace=0.75)
+            self.axes_key = key
+        else:
+            for axis in self.axes:
+                axis.clear()
+            if self.ax2 is not None:
+                self.ax2.clear()
+        if self.ax2 is not None:
+            # clear() puts a twinned axis's label back on the left, where it
+            # lands on top of the first axis's. The ticks survive; the label
+            # does not.
+            self.ax2.yaxis.set_label_position("right")
+            self.ax2.yaxis.set_ticks_position("right")
+        return self.axes
+
+    def draw_preview(self):
+        """Every enabled trace, on one shared time axis or on one each.
+
+        Shared is the default and the honest one: the channels are simultaneous
+        on the bench, and a window each would draw them as if aligned when they
+        are not. But a 10 Hz ramp beside a 1 MHz tone leaves the fast trace a
+        solid band, and **separate time axes** is for that - each trace framed
+        by its own period, at the cost of the two no longer sharing a clock.
+
+        The pending waveform is drawn as it would come out of the channel it is
+        aimed at, dashed and in a paler shade of that channel's colour.
         """
         if self.canvas is None:
             return
-        self.ax.clear()
-        self.ax2.clear()
-        # clear() puts a twinned axis's label back on the left, where it lands on
-        # top of the first axis's label. The ticks survive; the label does not.
-        self.ax2.yaxis.set_label_position("right")
-        self.ax2.yaxis.set_ticks_position("right")
-
         wanted = [ch for ch in CHANNELS if self.show_ch[ch].get()]
         target = int(self.arb_ch.get())
         pending = None
@@ -3302,76 +3430,102 @@ class App:
             except ValueError:
                 pending = None
 
-        periods = [self.channel_period(ch) for ch in wanted]
-        if pending is not None:
-            periods.append(self.pending_period(target, pending.size))
-        if not periods:
-            self.ax.text(0.5, 0.5,
-                         "nothing selected" + chr(10) +
-                         "tick CH1, CH2 or pending",
-                         ha="center", va="center", transform=self.ax.transAxes,
-                         color="#666")
-            self.ax.set_xticks([]); self.ax.set_yticks([])
-            self.ax2.set_visible(False)
+        if not wanted and pending is None:
+            axis = self.preview_axes(1, False)[0]
+            axis.text(0.5, 0.5,
+                      "nothing selected" + chr(10) + "tick CH1, CH2 or pending",
+                      ha="center", va="center", transform=axis.transAxes,
+                      color="#666")
+            axis.set_xticks([]); axis.set_yticks([])
+            self.show_alias_note({}, target, None, 0.0)
             self.canvas.draw_idle()
             return
 
-        span = 2.0 * max(periods)
-        self.show_alias_note(wanted, target, pending, span)
-        # Two y axes only earn their keep when there are two channels to
-        # separate; with one trace it is just a duplicated scale.
-        split = self.split_y.get() and len(wanted) == 2
-        self.ax2.set_visible(split)
-
-        handles, notes = [], []
-        for ch in wanted:
-            axis = self.ax2 if (split and ch == 2) else self.ax
-            curve, label = self.trace_for(ch, span)
-            if curve is None:
-                notes.append(label)
-                continue
-            t, v = curve
-            handles += axis.plot(t * 1e3, v, lw=1.1, color=CH_COLOUR[ch],
-                                 label=label)
-
+        # One panel per channel when times are split, otherwise all in one. The
+        # pending trace joins the panel holding the channel it is aimed at, and
+        # gets a panel of its own only when that channel is not being shown.
+        if self.split_t.get():
+            groups = [[ch] for ch in wanted]
+            if pending is not None and target not in wanted:
+                groups.append([])
+        else:
+            groups = [list(wanted)]
+        pending_at = None
         if pending is not None:
-            axis = self.ax2 if (split and target == 2) else self.ax
-            vals = {key: self.vars[f"C{target}:BSWV:{key}"].get().strip()
-                    for key, _, _ in WAVE_PARAMS}
-            hold = self.arb_style(target)[0] == "steps-post"
-            mode, mod = self.channel_mode(target)
-            # arb_period rather than period: what times an arb is how often
-            # the record repeats, and the window is already fixed by span. A
-            # period passed here would be read by nothing, which is how this
-            # trace came to be drawn at the channel's stale frequency.
-            curve = preview_curve(
-                "ARB", vals, arb=pending, hold=hold, span=span, mode=mode, mod=mod,
-                invert=self.vars[f"C{target}:OUTP:PLRT"].get().strip() == "INVT",
-                arb_period=self.pending_arb_period(target, pending.size))
-            if curve is not None:
-                t, v = curve[:2]
-                handles += axis.plot(
-                    t * 1e3, v, lw=1.2, ls="--", color=CH_COLOUR[target],
-                    label=f"pending -> CH{target} ({pending.size} pts, "
-                          f"{'held' if hold else 'interpolated'})")
+            pending_at = next((i for i, g in enumerate(groups) if target in g),
+                              len(groups) - 1)
 
-        self.ax.set_xlabel("time (ms)")
-        self.ax.grid(alpha=0.3)
-        if split:
-            self.ax.set_ylabel("CH1 volts", color=CH_COLOUR[1])
-            self.ax2.set_ylabel("CH2 volts", color=CH_COLOUR[2])
-            self.ax.tick_params(axis="y", colors=CH_COLOUR[1])
-            self.ax2.tick_params(axis="y", colors=CH_COLOUR[2])
-        else:
-            self.ax.set_ylabel("volts", color="black")
-            self.ax.tick_params(axis="y", colors="black")
-        if handles:
-            self.ax.legend(handles, [h.get_label() for h in handles],
-                           fontsize=7, loc="upper right", framealpha=0.85)
-        if notes:
-            self.ax.set_title(" | ".join(notes), fontsize=8, color="#666")
-        else:
-            self.ax.set_title("")
+        # Two y axes only earn their keep when two channels share one panel;
+        # with a panel each they already have a scale apiece.
+        twin = (not self.split_t.get() and self.split_y.get()
+                and len(wanted) == 2)
+        axes = self.preview_axes(len(groups), twin)
+
+        spans, pending_span, notes = {}, 0.0, []
+        for index, (axis, group) in enumerate(zip(axes, groups)):
+            periods = [self.channel_period(ch) for ch in group]
+            if index == pending_at:
+                periods.append(self.pending_period(target, pending.size))
+            span = 2.0 * max(periods)
+            for ch in group:
+                spans[ch] = span
+            if index == pending_at:
+                pending_span = span
+
+            handles = []
+            for ch in group:
+                where = self.ax2 if (twin and ch == 2) else axis
+                curve, label = self.trace_for(ch, span)
+                if curve is None:
+                    notes.append(label)
+                    continue
+                t, v = curve
+                handles += where.plot(t * 1e3, v, lw=1.1, color=CH_COLOUR[ch],
+                                      label=label)
+
+            if index == pending_at:
+                where = self.ax2 if (twin and target == 2) else axis
+                vals = {key: self.vars[f"C{target}:BSWV:{key}"].get().strip()
+                        for key, _, _ in WAVE_PARAMS}
+                hold = self.arb_style(target)[0] == "steps-post"
+                mode, mod = self.channel_mode(target)
+                # arb_period rather than period: what times an arb is how often
+                # the record repeats, and the window is already fixed by span.
+                # A period passed here would be read by nothing, which is how
+                # this trace came to be drawn at the channel's stale frequency.
+                curve = preview_curve(
+                    "ARB", vals, arb=pending, hold=hold, span=span, mode=mode,
+                    mod=mod, invert=self.vars[f"C{target}:OUTP:PLRT"].get()
+                    .strip() == "INVT",
+                    arb_period=self.pending_arb_period(target, pending.size))
+                if curve is not None:
+                    t, v = curve[:2]
+                    handles += where.plot(
+                        t * 1e3, v, lw=1.4, ls="--",
+                        color=PENDING_COLOUR[target],
+                        label=f"pending -> CH{target} ({pending.size} pts, "
+                              f"{'held' if hold else 'interpolated'})")
+
+            axis.set_xlabel("time (ms)")
+            axis.grid(alpha=0.3)
+            if twin:
+                axis.set_ylabel("CH1 volts", color=CH_COLOUR[1])
+                self.ax2.set_ylabel("CH2 volts", color=CH_COLOUR[2])
+                axis.tick_params(axis="y", colors=CH_COLOUR[1])
+                self.ax2.tick_params(axis="y", colors=CH_COLOUR[2])
+            elif len(groups) > 1 and group:
+                axis.set_ylabel(f"CH{group[0]} volts", color=CH_COLOUR[group[0]])
+                axis.tick_params(axis="y", colors=CH_COLOUR[group[0]])
+            else:
+                axis.set_ylabel("volts", color="black")
+                axis.tick_params(axis="y", colors="black")
+            if handles:
+                axis.legend(handles, [h.get_label() for h in handles],
+                            fontsize=7, loc="upper right", framealpha=0.85)
+
+        self.show_alias_note(spans, target, pending, pending_span)
+        self.axes[0].set_title(" | ".join(notes) if notes else "",
+                               fontsize=8, color="#666")
         self.canvas.draw_idle()
 
     # -- config ------------------------------------------------------------
