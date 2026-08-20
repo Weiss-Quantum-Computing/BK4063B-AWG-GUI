@@ -285,6 +285,42 @@ loading a record of a different length is precisely what changes that frequency.
 Under DDS the record is one period whatever its length, so the channel's
 frequency stands.
 
+### What the preview models
+
+Everything on the channel panel reaches the trace:
+
+| | |
+|---|---|
+| Wave shape | sine, square, ramp, pulse, noise, DC, arb |
+| Levels | amplitude, offset, phase, output polarity (inverts about the offset) |
+| Shape detail | duty, symmetry, pulse width, **rise, fall, delay** |
+| Modulation | AM, DSBAM, FM, PM, PWM, ASK, FSK, PSK |
+| Sweep | time, start, stop, linear/log, direction |
+| Burst | period, cycle count, delay (N-cycle) |
+| Arb | the local copy, held or interpolated per the clock |
+
+![Parameters the preview now honours](Waveforms/preview_modes.png)
+
+**With a mode running, the window follows the envelope rather than the carrier** -
+the modulating period for AM/FM/PM/PWM, the keying period for the shift keys, the
+sweep time, the burst period. Two carrier cycles of a 10 kHz tone under 100 Hz AM
+is a flat sine with no modulation visible at all, which is exactly how the preview
+managed to look plausible while ignoring the whole modulation row.
+
+Two things are **not** modelled, and say so on the plot rather than drawing a
+guess: a **gated burst**, which follows an external signal this app knows nothing
+about, and an **arb with no local copy**, whose samples the generator will not
+report.
+
+One caveat worth keeping in mind. The shapes come from the standard definitions -
+AM at 0% depth is half amplitude and at 100% just reaches zero, FM deviation is
+peak, PM deviation is in degrees - and they are checked against arithmetic
+(a ±500 Hz square FM on a 1 kHz carrier gives exactly 150 zero crossings in the
+high half and 50 in the low). They have **not** been checked against this
+generator's analogue output, so if a depth or deviation convention differs
+slightly, the preview will differ with it. The scope on the bench settles any
+case where that matters.
+
 ### separate Y axes
 
 With both channels on one scale, a small signal beside a large one is a flat

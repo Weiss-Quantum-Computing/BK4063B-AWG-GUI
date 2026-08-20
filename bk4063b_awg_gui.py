@@ -597,8 +597,104 @@ def parse_reply(response):
     return out
 
 
+def _mod_wave(name, u):
+    """The modulating signal, -1..1, from its own phase u (in cycles)."""
+    u = u % 1.0
+    name = (name or "SINE").upper()
+    if name == "SQUARE":
+        return np.where(u < 0.5, 1.0, -1.0)
+    if name == "TRIANGLE":
+        return 1.0 - 4.0 * np.abs(((u + 0.25) % 1.0) - 0.5)
+    if name == "UPRAMP":
+        return 2.0 * u - 1.0
+    if name == "DNRAMP":
+        return 1.0 - 2.0 * u
+    if name == "NOISE":
+        return np.clip(np.random.default_rng(0).standard_normal(u.size) / 3.0,
+                       -1.0, 1.0)
+    return np.sin(2.0 * np.pi * u)
+
+
+def _shape(wvtp, ph, num, period, arb, hold, duty_over=None):
+    """Unit shape, -1..1, from carrier phase ph (in cycles)."""
+    x = ph % 1.0
+    if wvtp == "SINE":
+        return np.sin(2.0 * np.pi * x)
+    if wvtp == "SQUARE":
+        duty = duty_over if duty_over is not None else num("DUTY", 50.0) / 100.0
+        return np.where(x < np.clip(duty, 1e-6, 1 - 1e-6), 1.0, -1.0)
+    if wvtp == "RAMP":
+        sym = np.clip(num("SYM", 50.0) / 100.0, 1e-6, 1 - 1e-6)
+        return np.where(x < sym, 2 * x / sym - 1, 1 - 2 * (x - sym) / (1 - sym))
+    if wvtp == "PULSE":
+        # Delay slides the pulse inside its own period; rise and fall are real
+        # times, so they only mean anything as a fraction of that period.
+        x = (x - num("DLY") / period) % 1.0
+        width = num("WIDTH")
+        duty = (width / period if width > 0
+                else (duty_over if duty_over is not None
+                      else num("DUTY", 20.0) / 100.0))
+        duty = np.clip(duty, 1e-6, 1 - 1e-6)
+        rise = max(num("RISE") / period, 1e-9)
+        fall = max(num("FALL") / period, 1e-9)
+        y = np.zeros_like(x)
+        y = np.where(x < rise, x / rise, y)
+        y = np.where((x >= rise) & (x < duty), 1.0, y)
+        y = np.where((x >= duty) & (x < duty + fall), 1.0 - (x - duty) / fall, y)
+        return 2.0 * y - 1.0
+    if wvtp == "ARB":
+        if arb is None or len(arb) < 2:
+            return None
+        pos = x * len(arb)
+        if hold:
+            # TrueArb: each stored point is held to the next clock, so floor the
+            # index and the staircase is in the samples themselves.
+            return arb[pos.astype(int) % len(arb)]
+        # DDS: the generator ramps from point to point. Interpolating has to
+        # happen here rather than by drawing style, because a floored index
+        # would bake the steps into the data and no line style could undo it.
+        wrapped = np.append(arb, arb[0])         # the record joins back on itself
+        return np.interp(pos % len(arb), np.arange(len(wrapped)), wrapped)
+    return None
+
+
+def _numget(source):
+    """Read panel strings as numbers, falling back when a box is empty."""
+    def num(key, default=0.0):
+        try:
+            return float(str(source.get(key, "")).strip() or default)
+        except (ValueError, AttributeError):
+            return default
+    return num
+
+
+def preview_period(wvtp, vals, mode="Off", mod=None):
+    """The repeat time worth drawing two of.
+
+    With a mode running that is the envelope, not the carrier: two carrier
+    cycles of a 1 kHz tone under 10 Hz AM is a flat sine with no modulation
+    visible, which is how the preview managed to look plausible while ignoring
+    the whole modulation row.
+    """
+    num, mnum = _numget(vals), _numget(mod or {})
+    freq = num("FRQ", 1000.0)
+    carrier = 1.0 / (freq if freq > 0 else 1000.0)
+    if mode == "Sweep":
+        return max(mnum("TIME", 1.0), 1e-9)
+    if mode == "Burst":
+        period = mnum("PRD", 0.0)
+        return period if period > 0 else carrier * max(mnum("TIME", 1.0), 1.0)
+    if mode in ("AM", "DSBAM", "FM", "PM", "PWM"):
+        rate = mnum("FRQ", 0.0)
+        return 1.0 / rate if rate > 0 else carrier
+    if mode in ("ASK", "FSK", "PSK"):
+        rate = mnum("KFRQ", 0.0)
+        return 1.0 / rate if rate > 0 else carrier
+    return carrier
+
+
 def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000, hold=True,
-                  period=None, span=None):
+                  period=None, span=None, mode="Off", mod=None, invert=False):
     """What the panel currently describes, in volts against seconds.
 
     Computed here rather than read back from the generator: the point is to show
@@ -611,57 +707,99 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000, hold=True,
     simultaneous in the real world, and drawing each over its own private window
     would imply they line up when they do not.
 
-    Returns (t, v) or None when there is nothing meaningful to draw.
-    """
-    def num(key, default=0.0):
-        try:
-            return float(vals.get(key, "") or default)
-        except ValueError:
-            return default
+    `mode` and `mod` carry the modulation/sweep/burst row. Everything that
+    varies with time is folded into an instantaneous frequency, a phase offset
+    and an amplitude scale, then integrated once - which is what lets FM, FSK
+    and a sweep share a path with a plain carrier instead of each being a
+    special case.
 
+    Returns (t, volts, note) or None when there is nothing meaningful to draw.
+    """
+    mod = mod or {}
+    num, mnum = _numget(vals), _numget(mod)
     amp, ofst = num("AMP", 1.0), num("OFST")
+    freq = num("FRQ", 1000.0)
+    if freq <= 0:
+        freq = 1000.0
+
     if period is None:
-        freq = num("FRQ", 1000.0)
-        period = 1.0 / (freq if freq > 0 else 1000.0)
+        period = preview_period(wvtp, vals, mode, mod)
     if span is None:
         span = periods * period
     t = np.linspace(0.0, span, n)
-    ph = num("PHSE") / 360.0
-    x = (t / period + ph) % 1.0                 # phase within a cycle, 0..1
+    dt = t[1] - t[0] if n > 1 else 1.0
+
+    f_inst = np.full(n, freq)                    # cycles per second
+    ph_off = np.full(n, num("PHSE") / 360.0)     # cycles
+    scale = np.ones(n)                           # amplitude multiplier
+    duty_over = None
+    note = ""
+
+    if mode in ("AM", "DSBAM"):
+        m = _mod_wave(mod.get("MDSP"), t * mnum("FRQ", 100.0))
+        if mode == "AM":
+            # The convention bench generators use: at 0% depth the output is
+            # half amplitude, at 100% the envelope just reaches zero.
+            scale = (1.0 + mnum("DEPTH", 100.0) / 100.0 * m) / 2.0
+        else:
+            scale = m                            # suppressed carrier
+    elif mode == "FM":
+        f_inst = freq + mnum("DEVI", 0.0) * _mod_wave(
+            mod.get("MDSP"), t * mnum("FRQ", 100.0))
+    elif mode == "PM":
+        ph_off = ph_off + mnum("DEVI", 0.0) / 360.0 * _mod_wave(
+            mod.get("MDSP"), t * mnum("FRQ", 100.0))
+    elif mode == "PWM":
+        base = (num("WIDTH") * freq if num("WIDTH") > 0
+                else num("DUTY", 20.0) / 100.0)
+        duty_over = np.clip(
+            base + mnum("DEVI", 0.0) * freq * _mod_wave(
+                mod.get("MDSP"), t * mnum("FRQ", 100.0)), 1e-6, 1 - 1e-6)
+    elif mode in ("ASK", "FSK", "PSK"):
+        key = _mod_wave("SQUARE", t * mnum("KFRQ", 100.0)) > 0
+        if mode == "ASK":
+            scale = np.where(key, 1.0, 0.0)
+        elif mode == "FSK":
+            f_inst = np.where(key, freq, mnum("HFRQ", freq))
+        else:
+            ph_off = ph_off + np.where(key, 0.0, 0.5)      # 180 degrees
+    elif mode == "Sweep":
+        sweep_t = max(mnum("TIME", 1.0), 1e-9)
+        start, stop = mnum("START", freq), mnum("STOP", freq)
+        u = (t % sweep_t) / sweep_t
+        if str(mod.get("DIR", "UP")).upper() == "DOWN":
+            u = 1.0 - u
+        if str(mod.get("SWMD", "LINE")).upper() == "LOG" and start > 0 and stop > 0:
+            f_inst = start * (stop / start) ** u
+        else:
+            f_inst = start + (stop - start) * u
+    elif mode == "Burst":
+        if str(mod.get("GATE_NCYC", "NCYC")).upper() == "GATE":
+            # Gated burst follows an external signal we know nothing about.
+            note = "gated burst: gate not modelled"
+        else:
+            cycles = max(mnum("TIME", 1.0), 0.0)
+            prd = mnum("PRD", 0.0) or (cycles / freq)
+            scale = np.where(np.mod(t - mnum("DLAY", 0.0), max(prd, 1e-12))
+                             < cycles / freq, 1.0, 0.0)
 
     if wvtp == "DC":
-        return t, np.full_like(t, ofst)
+        return t, np.full(n, ofst), note
     if wvtp == "NOISE":
-        rng = np.random.default_rng(0)          # fixed seed: a still picture
-        return t, num("MEAN") + num("STDEV", 0.5) * rng.standard_normal(n)
-    if wvtp == "SINE":
-        y = np.sin(2 * np.pi * x)
-    elif wvtp == "SQUARE":
-        y = np.where(x < num("DUTY", 50.0) / 100.0, 1.0, -1.0)
-    elif wvtp == "RAMP":
-        sym = np.clip(num("SYM", 50.0) / 100.0, 1e-6, 1 - 1e-6)
-        y = np.where(x < sym, 2 * x / sym - 1, 1 - 2 * (x - sym) / (1 - sym))
-    elif wvtp == "PULSE":
-        width = num("WIDTH")
-        duty = width / period if width > 0 else num("DUTY", 20.0) / 100.0
-        y = np.where(x < np.clip(duty, 1e-6, 1 - 1e-6), 1.0, -1.0)
-    elif wvtp == "ARB":
-        if arb is None or len(arb) < 2:
-            return None                          # shape lives on the instrument
-        pos = x * len(arb)
-        if hold:
-            # TrueArb: each stored point is held to the next clock, so floor the
-            # index and the staircase is in the samples themselves.
-            y = arb[pos.astype(int) % len(arb)]
-        else:
-            # DDS: the generator ramps from point to point. Interpolating has to
-            # happen here rather than by drawing style, because a floored index
-            # would bake the steps into the data and no line style could undo it.
-            wrapped = np.append(arb, arb[0])     # the record joins back on itself
-            y = np.interp(pos % len(arb), np.arange(len(wrapped)), wrapped)
-    else:
+        rng = np.random.default_rng(0)           # fixed seed: a still picture
+        y = num("STDEV", 0.5) * rng.standard_normal(n) * scale
+        return t, num("MEAN") + (-y if invert else y), note
+
+    # One phase accumulator for the lot: a plain carrier is the constant case,
+    # and FM, FSK and a sweep are the same integral with f varying.
+    ph = np.cumsum(f_inst) * dt + ph_off
+    y = _shape(wvtp, ph, num, period, arb, hold, duty_over=duty_over)
+    if y is None:
         return None
-    return t, ofst + (amp / 2.0) * y
+    y = y * scale
+    if invert:
+        y = -y                                   # polarity flips the AC part only
+    return t, ofst + (amp / 2.0) * y, note
 
 
 # ---------------------------------------------------------------------------
@@ -2022,26 +2160,49 @@ class App:
         name = self.vars[f"C{ch}:ARWV:NAME"].get().strip()
         arb = self.known_waves.get(name) if wvtp == "ARB" else None
         hold = self.arb_style(ch)[0] == "steps-post"
+        mode, mod = self.channel_mode(ch)
         curve = preview_curve(wvtp, vals, arb=arb, hold=hold, span=span,
-                              period=self.channel_period(ch))
+                              period=self.channel_period(ch), mode=mode, mod=mod,
+                              invert=self.vars[f"C{ch}:OUTP:PLRT"].get().strip()
+                              == "INVT")
         if curve is None:
             return None, (f"CH{ch} {wvtp} '{name}' not held locally"
                           if wvtp == "ARB" else f"CH{ch} {wvtp}")
         label = f"CH{ch} {wvtp}"
+        if mode != "Off":
+            label += f" +{mode}"
         if arb is not None:
             # Say which way the clock joins the points up: it changes the shape
             # on screen, so the trace should carry it rather than leaving the
             # reader to check the Clock cell.
             label += f" '{name}' ({'held' if hold else 'interpolated'})"
-        return curve, label
+        if curve[2]:
+            label += f" [{curve[2]}]"
+        return curve[:2], label
+
+    def channel_mode(self, ch):
+        """The modulation/sweep/burst row as (mode, {SCPI key: value})."""
+        mode = self.vars[f"C{ch}:MODE"].get().strip() or "Off"
+        params = {}
+        for slot in range(MODE_SLOTS):
+            key = self.mode_key(ch, slot)
+            value = self.vars[f"C{ch}:MODE:{slot}"].get().strip()
+            if key and value:
+                params[key] = value
+        return mode, params
 
     def channel_period(self, ch):
-        """Repeat time of whatever the channel is set to, in seconds."""
-        try:
-            freq = float(self.vars[f"C{ch}:BSWV:FRQ"].get().strip() or 0)
-        except ValueError:
-            freq = 0.0
-        return 1.0 / freq if freq > 0 else 1e-3
+        """Repeat time of whatever the channel is set to, in seconds.
+
+        Deferred to preview_period so a modulated channel is framed by its
+        envelope rather than its carrier - otherwise slow modulation on a fast
+        carrier is drawn as a plain unmodulated tone.
+        """
+        vals = {key: self.vars[f"C{ch}:BSWV:{key}"].get().strip()
+                for key, _, _ in WAVE_PARAMS}
+        mode, mod = self.channel_mode(ch)
+        return preview_period(self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper(),
+                              vals, mode, mod)
 
     def pending_period(self, ch, n_points):
         """How long the pending record would last on the channel it is aimed at.
@@ -2121,7 +2282,7 @@ class App:
             curve = preview_curve("ARB", vals, arb=pending, hold=hold, span=span,
                                   period=self.pending_period(target, pending.size))
             if curve is not None:
-                t, v = curve
+                t, v = curve[:2]
                 handles += axis.plot(
                     t * 1e3, v, lw=1.2, ls="--", color=CH_COLOUR[target],
                     label=f"pending -> CH{target} ({pending.size} pts, "
