@@ -181,6 +181,102 @@ Two fields earn their keep on an AMO bench:
 never from the previous train - so changing the count and pressing again does
 what you meant rather than squaring the record.
 
+## Sequences
+
+Where a train repeats one element, a **sequence** lays down segments that need
+not resemble each other: a Blackman at 5 MHz, a gap, the same envelope at half
+the amplitude and ninety degrees, a slow ramp, a hold, a ramp back down. Each
+segment carries its own shape, duration, amplitude, carrier frequency and phase,
+and its own gap to whatever follows. The whole thing becomes one arb record and
+uploads as one.
+
+**Sequence...** in the Build waveform row opens its own window - a sequence is a
+table, and the panel has nowhere to put one. It is deliberately not modal, so
+the preview behind it redraws every time you press **Build** and you can tune
+the sequence against the picture.
+
+| Column | Meaning |
+|--------|---------|
+| Shape | any shape the builder offers, plus **Local waveform** |
+| Time | how long the segment lasts |
+| Ampl | scale factor for this segment, relative to the others |
+| Carrier (Hz) | a carrier filling the segment. `0` for none |
+| Phase (deg) | the phase that carrier starts at |
+| Gap after | dead time before the next segment, held at the baseline |
+| Extra | the shape's own parameters as `key=value` - `start=0 end=1`, `level=1`, `trunc=4`, `name=<waveform>` |
+
+`^ v` move a segment, `D` duplicates it, `X` deletes it. The running total under
+the list says how many segments, how long, and how many points.
+
+### Time, and why the clock is part of the specification
+
+A sequence is written in **real time against a sample rate**, not in fractions of
+a record the way a train is. That is the whole point: its segments differ in
+length, and "2 us at 5 MHz" is how a pulse is actually specified at the bench.
+The rate is what turns a duration into a point count and a carrier in hertz into
+cycles across the segment - so **a sequence is only true at the rate it was built
+for**.
+
+Bare numbers are in the unit picked at the top of the window; a suffix overrides
+it for one field, so a sequence of microsecond pulses with a 200 ms hold in the
+middle is typed as `2` and `200m` rather than as `2` and `200000`. Suffixes are
+`n`/`ns`, `u`/`us`, `m`/`ms` and `s`.
+
+Because seconds only exist on this generator under **TrueArb**, building also
+sets the target channel to ARB / TrueArb / that rate - as unapplied edits with
+the usual asterisks, so Apply is still the thing that changes the instrument.
+Under DDS the record is one period at whatever frequency the channel holds, and
+every duration in the sequence is a fiction. Untick the box if you want the
+panel left alone.
+
+### Phase
+
+**phase coherent** references every carrier to the start of the sequence rather
+than to its own segment, which is what makes the second pulse of a Ramsey pair
+arrive with a defined phase relative to the first: a 1 us pulse and a 0.5 us gap
+at 1 MHz puts the second pulse half a cycle out, inverted. Off - the default -
+the phase you type is exactly the phase the segment starts at, which is easier to
+read on a scope and is what you want when the segments are unrelated.
+
+Segment carriers are sampled **half-open**: `cycles` cycles across `n` samples,
+not across `n-1`. A record that loops on itself can afford the closed interval
+the builder uses; a segment butted against the next one cannot, or its frequency
+comes out `n/(n-1)` high and it hands its neighbour a phase one sample out. The
+shape keeps the closed interval, because a ramp typed `0` to `1` should reach 1
+where a carrier's endpoints are merely where the window fell.
+
+### The two shapes a sequence adds
+
+- **Hold (DC)** is a flat `level`, which is what a ramp needs to sit on. Ramp up,
+  hold, ramp down is three segments: `Linear ramp` with `start=0 end=1`,
+  `Hold (DC)` with `level=1`, `Linear ramp` with `start=1 end=0`. With a carrier
+  it is a rectangular-envelope burst instead.
+- **Local waveform** takes any waveform this app holds a copy of - `name=<what
+  it is called>` in Extra - and stretches it into whatever time the segment is
+  given, so one stored record can appear twice at two different lengths.
+
+### Keeping a sequence
+
+**Copy spec** puts the sequence on the clipboard as text and **Paste spec...**
+reads it back, so a sequence can live in a `.txt` beside the data it produced or
+come out of a script:
+
+```
+# BK4063B sequence at 1e8 Sa/s, bare times in us
+# shape, time, ampl, freq, phase, gap, extra
+Blackman, 2, 1, 5e6, 0, 10
+Blackman, 2, 0.5, 5e6, 90, 10
+Blackman, 4, 1, 4.8e6, 0, 0
+```
+
+Everything after the sixth comma is the Extra field, so a value with commas of
+its own - `tones=10,20,35` - survives. Blank lines and `#` comments are skipped,
+as everywhere else numbers are pasted in.
+
+The result lands as the pending waveform like anything else built here, which
+means it also becomes the element the **Pulse train** repeats - so a sequence can
+itself be repeated into a longer record.
+
 ## Uploading an arbitrary waveform
 
 **Load file...**, pick the column if you are asked, set a name and a channel, then

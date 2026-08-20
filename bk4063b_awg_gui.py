@@ -305,6 +305,12 @@ def _build_tanh_top(n, p):
     return _tanh_top(n, p.num("edge", 0.1), p.num("flat", 0.6))
 
 
+def _build_dc(n, p):
+    """A flat level. On its own it is the hold between two ramps; with a
+    carrier it is a rectangular-envelope burst."""
+    return np.full(n, p.num("level", 1.0))
+
+
 def _build_linear(n, p):
     start, end = p.num("start", 0.0), p.num("end", 1.0)
     return start + (end - start) * _unit(n)
@@ -379,6 +385,8 @@ BUILD_SHAPES = {
     "Tanh flat-top":   (_build_tanh_top,
                         [("Edge fraction", "edge", "0.1", None),
                          ("Flat fraction", "flat", "0.6", None)] + _CARRIER),
+    "Hold (DC)":       (_build_dc,
+                        [("Level", "level", "1", None)] + _CARRIER),
     "Linear ramp":     (_build_linear,
                         [("Start", "start", "0", None),
                          ("End", "end", "1", None)] + _CARRIER),
@@ -479,6 +487,262 @@ def pulse_train(element, count, period=2.0, lead=0.0, baseline=0.0,
         if after:
             pieces.append(np.full(after, baseline))
     return np.concatenate(pieces)
+
+
+# A sequence is built in real time against a sample clock, not in fractions of
+# a record: the whole point is that its segments differ in length, and "2 us at
+# 5 MHz" is how a pulse is specified at the bench. That makes the clock part of
+# the specification rather than something chosen afterwards.
+SEQ_LOCAL = "Local waveform"
+SEQ_UNITS = ("ns", "us", "ms", "s")
+_TIME_UNITS = {"s": 1.0, "ms": 1e-3, "m": 1e-3, "us": 1e-6, "u": 1e-6,
+               "ns": 1e-9, "n": 1e-9}
+
+# (label, key, default, entry width). One row of these per segment.
+SEQ_COLUMNS = [("Shape", "shape", "Blackman", 16),
+               ("Time", "time", "1", 8),
+               ("Ampl", "ampl", "1", 6),
+               ("Carrier (Hz)", "freq", "0", 10),
+               ("Phase (deg)", "phase", "0", 8),
+               ("Gap after", "gap", "0", 8),
+               ("Extra (key=value)", "extra", "", 20)]
+
+
+SEQ_DEFAULT = {key: default for _, key, default, _ in SEQ_COLUMNS}
+
+
+def _secs(value):
+    for scale, suffix in ((1.0, " s"), (1e-3, " ms"), (1e-6, " us"),
+                          (1e-9, " ns")):
+        if abs(value) >= scale:
+            return f"{value / scale:.4g}{suffix}"
+    return f"{value * 1e12:.4g} ps"
+
+
+def parse_time(text, unit="us", default=0.0):
+    """Seconds from '2', '2u', '2us', '1.5ms', '200m' or '2e-6s'.
+
+    A bare number is in `unit`, the sequence's own setting, so microsecond
+    pulses are typed as 2 rather than 0.000002 - and a 200 ms hold in the
+    middle of that same sequence is still typed as 200m rather than as 200000.
+    """
+    raw = str(text if text is not None else "").strip().lower()
+    raw = raw.replace("\u00b5", "u").replace("sec", "s")
+    if not raw:
+        return default
+    match = re.fullmatch(r"([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)\s*([a-z]*)",
+                         raw)
+    if not match:
+        raise ValueError(f"cannot read {text!r} as a time")
+    value, suffix = float(match.group(1)), match.group(2) or unit
+    if suffix not in _TIME_UNITS:
+        raise ValueError(f"unknown time unit {suffix!r} in {text!r}")
+    return value * _TIME_UNITS[suffix]
+
+
+def parse_kv(text):
+    """'trunc=3 flat=0.6' -> {'trunc': '3', 'flat': '0.6'}.
+
+    Split on whitespace and semicolons but never on commas, so a value that is
+    itself a list - Multitone's 'tones=10,20,35' - survives intact.
+    """
+    out = {}
+    for token in re.split(r"[;\s]+", str(text or "").strip()):
+        if not token:
+            continue
+        key, sep, value = token.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"extra parameter {token!r} should be key=value")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _as_float(text, default=0.0):
+    try:
+        return float(str(text).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def seq_shapes():
+    """Every shape a segment can be, in the order the dropdown offers them."""
+    return list(BUILD_SHAPES) + [SEQ_LOCAL]
+
+
+def resolve_shape(name):
+    """Match a typed shape name case-insensitively, or say what is on offer."""
+    text = str(name or "").strip()
+    for candidate in seq_shapes():
+        if candidate.lower() == text.lower():
+            return candidate
+    raise ValueError(f"unknown shape {text!r} - one of: "
+                     + ", ".join(seq_shapes()))
+
+
+def _carrier(n, cycles, phase):
+    """`cycles` cycles across n samples, sampled half-open.
+
+    Not `_unit(n)`, which runs 0..1 inclusive and so spends n samples covering
+    n-1 intervals: a segment built that way carries its frequency about
+    n/(n-1) high and hands the next segment a phase one sample out. Fine for a
+    record that loops on itself, wrong for one that is butted against another,
+    which is the whole of what a sequence is.
+
+    The shape keeps the inclusive convention - a ramp typed 0 to 1 should
+    reach 1 - because a shape's endpoints are specified where a carrier's are
+    merely where the window fell.
+    """
+    return np.sin(2 * np.pi * cycles * (np.arange(n) / n) + np.deg2rad(phase))
+
+
+def _segment_samples(shape, n, extra, cycles, phase, waves):
+    """One segment's samples, unit amplitude."""
+    for key in ("cycles", "cphase"):
+        if key in extra:
+            raise ValueError(
+                f"put the carrier in the Carrier (Hz) and Phase columns, not "
+                f"in {key}= - a sequence knows how long the segment is, so it "
+                f"can work in hertz where the builder has to work in cycles")
+    if shape != SEQ_LOCAL:
+        y = build_waveform(shape, n, extra)
+        return y * _carrier(n, cycles, phase) if cycles > 0 else y
+    name = str(extra.get("name", "")).strip()
+    src = (waves or {}).get(name)
+    if src is None:
+        raise ValueError(f"no local copy of a waveform called {name!r} - "
+                         "give the segment 'name=<waveform>'")
+    src = np.asarray(src, dtype=np.float64).ravel()
+    if src.size < 2:
+        raise ValueError(f"{name!r} has too few samples to use")
+    # Stretched or squeezed into whatever time the sequence gives it, so one
+    # stored record can appear at two lengths in the same sequence.
+    y = np.interp(np.linspace(0.0, src.size - 1.0, n), np.arange(src.size), src)
+    return y * _carrier(n, cycles, phase) if cycles > 0 else y
+
+
+def build_sequence(segments, rate, unit="us", baseline=0.0, coherent=False,
+                   waves=None):
+    """Concatenate differently-specified segments into one record.
+
+    Where `pulse_train` repeats one element, this stacks segments that need not
+    resemble each other: a Blackman at 5 MHz, a gap, the same envelope at half
+    the amplitude and ninety degrees, a slow ramp, a hold, a ramp back down.
+    Each segment carries its own shape, duration, amplitude, carrier frequency
+    and phase, and its own gap to whatever follows.
+
+    `rate` is the sample clock the record is meant to be played at, in Sa/s -
+    it is what turns a duration in seconds into a point count and a carrier in
+    hertz into cycles across the segment, so a sequence is only true at the
+    rate it was built for.
+
+    `coherent` references every carrier to the start of the sequence rather
+    than to its own segment, which is what makes the second pulse of a Ramsey
+    pair arrive with a defined phase relative to the first. Off, the typed
+    phase is exactly the phase the segment starts at.
+
+    Returns (samples, [(index, shape, points, seconds, gap seconds), ...]).
+    """
+    rate = _as_float(rate, 0.0)
+    if rate <= 0:
+        raise ValueError("sample rate must be a positive number of Sa/s")
+
+    pieces, rows, elapsed = [], [], 0.0
+    for index, seg in enumerate(segments, 1):
+        if not str(seg.get("shape", "")).strip():
+            continue
+        shape = resolve_shape(seg.get("shape"))
+        span = parse_time(seg.get("time"), unit, 0.0)
+        gap = parse_time(seg.get("gap"), unit, 0.0)
+        if span < 0 or gap < 0:
+            raise ValueError(f"segment {index} ({shape}) has a negative time")
+        n = int(round(span * rate))
+        if n < 2:
+            raise ValueError(
+                f"segment {index} ({shape}) comes to {n} point(s) at "
+                f"{rate:.10g} Sa/s - give it a longer time or a faster clock")
+        freq = _as_float(seg.get("freq"), 0.0)
+        phase = _as_float(seg.get("phase"), 0.0)
+        if coherent:
+            # As though a reference oscillator at this segment's frequency had
+            # been running since the sequence began.
+            phase += 360.0 * freq * elapsed
+        y = _segment_samples(shape, n, parse_kv(seg.get("extra")),
+                             freq * span, phase, waves)
+        pieces.append(np.asarray(y, dtype=np.float64) * _as_float(
+            seg.get("ampl"), 1.0))
+        rows.append((index, shape, n, span, gap))
+        elapsed += span
+
+        gap_n = int(round(gap * rate))
+        if gap_n > 0:
+            pieces.append(np.full(gap_n, float(baseline)))
+        elapsed += gap
+
+    if not pieces:
+        raise ValueError("no segments to build - add one first")
+    return np.concatenate(pieces), rows
+
+
+def sequence_extent(segments, rate, unit="us"):
+    """(segments, seconds, points) without building the samples.
+
+    Wanted on every keystroke to keep the running total honest, which is why it
+    tolerates a half-typed number instead of raising at one.
+    """
+    rate = _as_float(rate, 0.0)
+    count, span, points = 0, 0.0, 0
+    for seg in segments:
+        if not str(seg.get("shape", "")).strip():
+            continue
+        count += 1
+        for key in ("time", "gap"):
+            try:
+                seconds = parse_time(seg.get(key), unit, 0.0)
+            except ValueError:
+                continue
+            span += seconds
+            points += int(round(seconds * rate)) if rate > 0 else 0
+    return count, span, points
+
+
+def parse_sequence_spec(text):
+    """Read a typed or pasted sequence back into segments.
+
+    One segment per line, fields in the order of SEQ_COLUMNS. Everything after
+    the sixth comma is the extra field, so a value with commas of its own
+    survives. Blank lines and # comments are skipped, as they are everywhere
+    else numbers are pasted in.
+    """
+    keys = [key for _, key, _, _ in SEQ_COLUMNS]
+    out = []
+    for number, line in enumerate(str(text or "").splitlines(), 1):
+        line = line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+        fields = [f.strip() for f in line.split(",", len(keys) - 1)]
+        try:
+            seg = {"shape": resolve_shape(fields[0])}
+        except ValueError as exc:
+            raise ValueError(f"line {number}: {exc}") from None
+        for key, value in zip(keys[1:], fields[1:]):
+            seg[key] = value
+        out.append({key: seg.get(key, "") for key in keys})
+    if not out:
+        raise ValueError("no segments found in that text")
+    return out
+
+
+def format_sequence_spec(segments, rate, unit="us"):
+    """Segments back out as the text `parse_sequence_spec` reads."""
+    keys = [key for _, key, _, _ in SEQ_COLUMNS]
+    lines = [f"# BK4063B sequence at {rate} Sa/s, bare times in {unit}",
+             "# " + ", ".join(key for _, key, _, _ in SEQ_COLUMNS)]
+    for seg in segments:
+        if not str(seg.get("shape", "")).strip():
+            continue
+        lines.append(", ".join(str(seg.get(key, "")).strip() for key in keys)
+                     .rstrip(", "))
+    return "\n".join(lines) + "\n"
 
 
 def parse_pasted(text):
@@ -1274,6 +1538,21 @@ class App:
         self.loading = False          # panel being filled from the generator
         self.quiet = False            # a var write that is not a user edit
 
+        # The sequence lives on the app rather than in its window, so closing
+        # the window and opening it again does not throw the sequence away.
+        self.seq_win = None
+        self.seq_data = [dict(SEQ_DEFAULT)]
+        self.seq_vars = []
+        self.seq_note = None
+        self.seq_canvas = None
+        self.seq_rate = tk.StringVar()
+        self.seq_unit = tk.StringVar(value="us")
+        self.seq_baseline = tk.StringVar(value="0")
+        self.seq_coherent = tk.BooleanVar(value=False)
+        self.seq_set_clock = tk.BooleanVar(value=True)
+        for var in (self.seq_rate, self.seq_unit, self.seq_baseline):
+            var.trace_add("write", lambda *_: self._seq_info())
+
         root.title("BK4063B AWG GUI")
         win_w = min(1330, root.winfo_screenwidth() - 80)
         win_h = min(900, root.winfo_screenheight() - 120)
@@ -1488,6 +1767,8 @@ class App:
         ttk.Button(r, text="Build", command=self.do_build).pack(side="left", padx=(10, 4))
         ttk.Button(r, text="Type/paste values...",
                    command=self.do_paste).pack(side="left")
+        ttk.Button(r, text="Sequence...",
+                   command=self.do_sequence).pack(side="left", padx=(4, 0))
 
         g = ttk.Frame(f)
         g.pack(fill="x", padx=6, pady=(2, 6))
@@ -1572,6 +1853,317 @@ class App:
 
         ttk.Button(row, text="Use these values", command=use).pack(side="left")
         ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
+        txt.focus_set()
+
+    # -- sequence editor ---------------------------------------------------
+
+    def do_sequence(self):
+        """A run of differently-specified segments, laid end to end.
+
+        Its own window rather than another panel row, because a sequence is a
+        table and the panel has nowhere to put one. Deliberately not modal: the
+        main preview is right behind it, so each Build redraws the picture the
+        sequence is being tuned against.
+        """
+        if self.seq_win is not None and self.seq_win.winfo_exists():
+            self.seq_win.lift()
+            self.seq_win.focus_force()
+            return
+        if not self.seq_rate.get().strip():
+            # Whatever the target channel is clocked at is the likeliest
+            # answer, since that is the rate the record will play at.
+            rate = self.vars[f"C{self.arb_ch.get()}:SRATE:VALUE"].get().strip()
+            self.seq_rate.set(rate if _as_float(rate, 0.0) > 0 else "1e6")
+
+        win = self.seq_win = tk.Toplevel(self.root)
+        win.title("Build a sequence")
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._seq_close)
+
+        ttk.Label(win, justify="left", foreground="#444", text=(
+            "Segments are laid end to end into one record, each with its own "
+            "shape, length, amplitude and carrier.\n"
+            "Times are in the unit below; a suffix overrides it for one field "
+            "(2u, 200m, 1.5s). Carrier is in hertz,\n"
+            "which only means anything at the sample rate given. Extra takes "
+            "the shape's own parameters as\n"
+            "key=value - start=0 end=1 for a ramp, level=1 for a hold, "
+            "name=<waveform> for a local waveform.")
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(top, text="Sample rate:").pack(side="left")
+        ttk.Entry(top, textvariable=self.seq_rate, width=10).pack(side="left",
+                                                                 padx=(3, 1))
+        ttk.Label(top, text="Sa/s").pack(side="left", padx=(0, 10))
+        ttk.Label(top, text="Times in:").pack(side="left")
+        ttk.Combobox(top, textvariable=self.seq_unit, values=list(SEQ_UNITS),
+                     width=4, state="readonly").pack(side="left", padx=(3, 10))
+        ttk.Label(top, text="Baseline:").pack(side="left")
+        ttk.Entry(top, textvariable=self.seq_baseline, width=6).pack(
+            side="left", padx=(3, 10))
+
+        opts = ttk.Frame(win)
+        opts.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Checkbutton(
+            opts, variable=self.seq_coherent,
+            text="phase coherent (reference every carrier to the sequence "
+                 "start, not to its own segment)").pack(anchor="w")
+        ttk.Checkbutton(
+            opts, variable=self.seq_set_clock,
+            text="set the target channel to TrueArb at this rate when "
+                 "building").pack(anchor="w")
+
+        holder = ttk.Frame(win)
+        holder.pack(fill="both", expand=True, padx=8, pady=(2, 2))
+        canvas = self.seq_canvas = tk.Canvas(holder, highlightthickness=0,
+                                             height=200)
+        bar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        self.seq_body = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=self.seq_body, anchor="nw")
+        self.seq_body.bind("<Configure>", lambda e: canvas.configure(
+            scrollregion=canvas.bbox("all")))
+        # Bound only while the pointer is over the list, so the wheel still
+        # belongs to whatever is under it everywhere else.
+        canvas.bind("<Enter>", lambda e: canvas.bind_all(
+            "<MouseWheel>",
+            lambda ev: canvas.yview_scroll(-1 * (ev.delta // 120), "units")))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        ttk.Label(win, foreground="#666",
+                  text="^ v move a segment    D duplicate    X delete").pack(
+                      anchor="w", padx=10, pady=(0, 2))
+
+        tools = ttk.Frame(win)
+        tools.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Button(tools, text="+ Add segment",
+                   command=self._seq_add).pack(side="left")
+        ttk.Button(tools, text="Paste spec...",
+                   command=self._seq_paste).pack(side="left", padx=(6, 0))
+        ttk.Button(tools, text="Copy spec",
+                   command=self._seq_copy).pack(side="left", padx=(6, 0))
+        self.seq_note = ttk.Label(tools, text="", foreground="#666")
+        self.seq_note.pack(side="left", padx=12)
+
+        buttons = ttk.Frame(win)
+        buttons.pack(fill="x", padx=8, pady=(2, 8))
+        ttk.Button(buttons, text="Build", command=self._seq_build).pack(
+            side="left")
+        ttk.Button(buttons, text="Close", command=self._seq_close).pack(
+            side="left", padx=6)
+
+        self._seq_redraw()
+        win.update_idletasks()
+        win.minsize(win.winfo_reqwidth(), win.winfo_reqheight())
+
+    def _seq_close(self):
+        if self.seq_win is not None:
+            self.seq_win.destroy()
+        self.seq_win, self.seq_note, self.seq_canvas = None, None, None
+        self.seq_vars = []
+
+    def _seq_redraw(self):
+        """Rebuild the rows from the data.
+
+        Cheaper to think about than patching widgets in place: reorder, insert
+        and delete all become one list operation followed by a redraw, and the
+        row numbers cannot drift out of step with the list.
+        """
+        for child in self.seq_body.winfo_children():
+            child.destroy()
+        # The variables have to be held here: a StringVar that is garbage
+        # collected takes its Tcl variable with it, and the row goes blank.
+        self.seq_vars = []
+
+        heads = ["#"] + [label for label, _, _, _ in SEQ_COLUMNS]
+        for col, text in enumerate(heads):
+            ttk.Label(self.seq_body, text=text, foreground="#444").grid(
+                row=0, column=col, sticky="w", padx=2, pady=(0, 2))
+
+        for index, seg in enumerate(self.seq_data):
+            ttk.Label(self.seq_body, text=str(index + 1),
+                      foreground="#666").grid(row=index + 1, column=0, padx=(2, 4))
+            for col, (_, key, _, width) in enumerate(SEQ_COLUMNS, start=1):
+                var = tk.StringVar(value=str(seg.get(key, "")))
+                var.trace_add("write", lambda *_, i=index, k=key, v=var:
+                              self._seq_edit(i, k, v))
+                self.seq_vars.append(var)
+                if key == "shape":
+                    widget = ttk.Combobox(self.seq_body, textvariable=var,
+                                          values=seq_shapes(), width=width,
+                                          state="readonly")
+                else:
+                    widget = ttk.Entry(self.seq_body, textvariable=var,
+                                       width=width)
+                widget.grid(row=index + 1, column=col, sticky="w", padx=2, pady=1)
+            row_tools = ttk.Frame(self.seq_body)
+            row_tools.grid(row=index + 1, column=len(SEQ_COLUMNS) + 1,
+                           padx=(8, 2))
+            for text, call in (("^", self._seq_up), ("v", self._seq_down),
+                               ("D", self._seq_dup), ("X", self._seq_del)):
+                ttk.Button(row_tools, text=text, width=2,
+                           command=lambda f=call, i=index: f(i)).pack(side="left")
+
+        # A canvas has no opinion about how wide the frame scrolling inside it
+        # is, so without this the row buttons sit past the right edge with no
+        # way to reach them - the scrollbar only moves the view up and down.
+        if self.seq_canvas is not None:
+            self.seq_body.update_idletasks()
+            self.seq_canvas.configure(width=self.seq_body.winfo_reqwidth())
+        self._seq_info()
+
+    def _seq_edit(self, index, key, var):
+        if 0 <= index < len(self.seq_data):
+            self.seq_data[index][key] = var.get()
+            self._seq_info()
+
+    def _seq_add(self):
+        self.seq_data.append(dict(SEQ_DEFAULT))
+        self._seq_redraw()
+
+    def _seq_dup(self, index):
+        self.seq_data.insert(index + 1, dict(self.seq_data[index]))
+        self._seq_redraw()
+
+    def _seq_del(self, index):
+        self.seq_data.pop(index)
+        if not self.seq_data:
+            self.seq_data.append(dict(SEQ_DEFAULT))
+        self._seq_redraw()
+
+    def _seq_up(self, index):
+        if index > 0:
+            self.seq_data[index - 1:index + 1] = [self.seq_data[index],
+                                                  self.seq_data[index - 1]]
+            self._seq_redraw()
+
+    def _seq_down(self, index):
+        if index < len(self.seq_data) - 1:
+            self.seq_data[index:index + 2] = [self.seq_data[index + 1],
+                                              self.seq_data[index]]
+            self._seq_redraw()
+
+    def _seq_info(self):
+        """The running total, recomputed on every keystroke."""
+        if self.seq_note is None:
+            return
+        count, span, points = sequence_extent(self.seq_data,
+                                              self.seq_rate.get(),
+                                              self.seq_unit.get())
+        text = (f"{count} segment{'' if count == 1 else 's'}, "
+                f"{_secs(span)}, {points} pts")
+        colour = "#666"
+        if points > 1000000:
+            text += " - long enough to be slow to send and slow to draw"
+            colour = "#c60"
+        self.seq_note.configure(text=text, foreground=colour)
+
+    def _seq_build(self):
+        """Make the record and hand it to the pending waveform."""
+        try:
+            out, rows = build_sequence(
+                self.seq_data, self.seq_rate.get(), unit=self.seq_unit.get(),
+                baseline=_as_float(self.seq_baseline.get(), 0.0),
+                coherent=bool(self.seq_coherent.get()), waves=self.known_waves)
+        except Exception as exc:
+            self.log(f"Could not build the sequence: {exc}")
+            messagebox.showerror("Cannot build sequence", str(exc),
+                                 parent=self.seq_win)
+            return
+
+        rate = _as_float(self.seq_rate.get(), 0.0)
+        self.log(f"Sequence: {len(rows)} segments, {out.size} pts, "
+                 f"{_secs(out.size / rate)} at {rate:.10g} Sa/s"
+                 + (" (phase coherent)" if self.seq_coherent.get() else ""))
+        for index, shape, n, span, gap in rows:
+            self.log(f"  {index}. {shape}, {_secs(span)} ({n} pts)"
+                     + (f", then {_secs(gap)} gap" if gap > 0 else ""))
+        self.take_table(out.reshape(-1, 1), None, "sequence", "sequence")
+        if self.seq_set_clock.get():
+            self._seq_set_clock(rate)
+
+    def _seq_set_clock(self, rate):
+        """Put the clock the sequence was designed for on the target channel.
+
+        A sequence is specified in seconds, and seconds only exist on this
+        generator under TrueArb at a stated rate: under DDS the record is one
+        period at whatever frequency the channel happens to hold, and every
+        duration in the sequence becomes a fiction. Left as unapplied edits
+        rather than sent, so it carries the same asterisks as anything typed by
+        hand and Apply is still the thing that changes the instrument.
+        """
+        ch = int(self.arb_ch.get())
+        # Wave type first: the sample-rate cells are greyed out under any other
+        # type, and a greyed cell is not collected for Apply.
+        for key, value in ((f"C{ch}:BSWV:WVTP", "ARB"),
+                           (f"C{ch}:SRATE:MODE", "TARB"),
+                           (f"C{ch}:SRATE:VALUE", f"{rate:.10g}")):
+            self.vars[key].set(value)
+        self.log(f"  CH{ch} panel set to ARB / TrueArb / {rate:.10g} Sa/s "
+                 "- not applied yet")
+
+    def _seq_copy(self):
+        text = format_sequence_spec(self.seq_data, self.seq_rate.get().strip(),
+                                    self.seq_unit.get())
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.log(f"Sequence spec copied to the clipboard "
+                 f"({len(self.seq_data)} segments)")
+
+    def _seq_paste(self):
+        """Type or paste a whole sequence at once.
+
+        Opens holding the sequence that is there now, so the same box is both
+        how a sequence gets in and how it gets read out to keep beside the data
+        it produced.
+        """
+        dlg = tk.Toplevel(self.seq_win)
+        dlg.title("Sequence spec")
+        dlg.transient(self.seq_win)
+        dlg.grab_set()
+        ttk.Label(dlg, justify="left", text=(
+            "One segment per line: " + ", ".join(
+                key for _, key, _, _ in SEQ_COLUMNS) + ".\n"
+            "Everything after the sixth comma is the extra field, so a value "
+            "with commas of its own survives.\n"
+            "Blank lines and # comments are skipped. Using this replaces the "
+            "whole sequence.")
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        box = ttk.Frame(dlg)
+        box.pack(fill="both", expand=True, padx=8)
+        txt = tk.Text(box, width=76, height=16, wrap="none",
+                      font=("Consolas", 9))
+        scroll = ttk.Scrollbar(box, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=scroll.set)
+        txt.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="left", fill="y")
+        txt.insert("1.0", format_sequence_spec(self.seq_data,
+                                               self.seq_rate.get().strip(),
+                                               self.seq_unit.get()))
+
+        row = ttk.Frame(dlg)
+        row.pack(fill="x", padx=8, pady=8)
+
+        def use():
+            try:
+                data = parse_sequence_spec(txt.get("1.0", "end"))
+            except Exception as exc:
+                messagebox.showerror("Cannot read sequence", str(exc),
+                                     parent=dlg)
+                return
+            dlg.destroy()
+            self.seq_data = data
+            self._seq_redraw()
+            self.log(f"Sequence spec read: {len(data)} segments")
+
+        ttk.Button(row, text="Use this sequence", command=use).pack(side="left")
+        ttk.Button(row, text="Cancel", command=dlg.destroy).pack(side="left",
+                                                                 padx=6)
         txt.focus_set()
 
     def build_train(self, parent, pad):
