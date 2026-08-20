@@ -72,7 +72,7 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
   not read back from the generator, which cannot report its samples. An arb is
   drawn from the local copy kept in `Waveforms/`, so anything uploaded through
   this app previews even sessions later; one put there by other means shows a
-  note instead of a guess.
+  note instead of a guess. See [Reading the preview](#reading-the-preview).
 
 ## Building a waveform in the panel
 
@@ -256,6 +256,46 @@ whole record is one period whatever its length - or set the sample rate to
 One more wrinkle: a waveform can carry a frequency stored with it at upload time,
 which the generator restores when you select it. This app never writes one, but
 waveforms put there by other software may have one.
+
+## Reading the preview
+
+Three traces, each switched on or off by its own checkbox:
+
+| Trace | Colour | Style |
+|-------|--------|-------|
+| CH1 | blue | solid |
+| CH2 | red | solid |
+| pending | colour of the channel it is aimed at | dashed |
+
+The pending waveform takes the colour of the **to CH** channel in the upload row,
+so changing that target recolours it - it is drawn as it would come out of the
+channel it is about to be sent to, not as an abstract shape. Each trace is
+labelled with its wave type, the arb name where there is one, and whether the
+clock is holding or interpolating.
+
+**All three share one time axis**, set to two periods of the slowest thing shown.
+That is deliberate: the two channels are simultaneous on the bench, and giving
+each its own private window would draw them as if aligned when they are not. A
+much faster channel will look dense, exactly as it would on a scope.
+
+The pending trace gets its timebase from the target channel the same way the
+generator would: under TrueArb that is `points / sample rate`, computed from the
+pending record's own length rather than the channel's present frequency - because
+loading a record of a different length is precisely what changes that frequency.
+Under DDS the record is one period whatever its length, so the channel's
+frequency stands.
+
+### separate Y axes
+
+With both channels on one scale, a small signal beside a large one is a flat
+line. Ticking **separate Y axes** gives CH1 the left axis and CH2 the right, each
+scaled to its own trace and coloured to match:
+
+![Shared scaling flattens CH1; separate axes make both readable](Waveforms/split_y_axes.png)
+
+Same two signals both times - 0.6 Vpp on CH1 against 8 Vpp on CH2. The pending
+trace follows whichever axis its target channel is on. The option is ignored when
+only one channel is displayed, since a second copy of one scale helps nobody.
 
 ### Held or interpolated - the clock decides
 

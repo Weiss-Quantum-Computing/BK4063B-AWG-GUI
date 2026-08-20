@@ -58,6 +58,9 @@ CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
 WAVE_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Waveforms")
 
 CHANNELS = (1, 2)
+# One colour per channel, used for the trace, the checkbox and the split
+# y axis, so a glance at any of them identifies the others.
+CH_COLOUR = {1: "#1f77b4", 2: "#d62728"}      # blue, red
 WAVE_TYPES = ("SINE", "SQUARE", "RAMP", "PULSE", "NOISE", "DC", "ARB")
 LOADS = ("50", "75", "100", "600", "10000", "HZ")
 
@@ -594,12 +597,20 @@ def parse_reply(response):
     return out
 
 
-def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000, hold=True):
-    """One or two cycles of what the panel currently describes, in volts.
+def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000, hold=True,
+                  period=None, span=None):
+    """What the panel currently describes, in volts against seconds.
 
     Computed here rather than read back from the generator: the point is to show
     what Apply would produce, before it is applied. `hold` picks how an arb gets
     from one stored point to the next - held under TrueArb, ramped under DDS.
+
+    `period` overrides the repeat time that would otherwise come from FRQ, and
+    `span` sets how much time to draw. Both exist so several traces can be put
+    on one shared time axis: two channels running at different frequencies are
+    simultaneous in the real world, and drawing each over its own private window
+    would imply they line up when they do not.
+
     Returns (t, v) or None when there is nothing meaningful to draw.
     """
     def num(key, default=0.0):
@@ -609,11 +620,12 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=2000, hold=True):
             return default
 
     amp, ofst = num("AMP", 1.0), num("OFST")
-    freq = num("FRQ", 1000.0)
-    if freq <= 0:
-        freq = 1000.0
-    period = 1.0 / freq
-    t = np.linspace(0.0, periods * period, n)
+    if period is None:
+        freq = num("FRQ", 1000.0)
+        period = 1.0 / (freq if freq > 0 else 1000.0)
+    if span is None:
+        span = periods * period
+    t = np.linspace(0.0, span, n)
     ph = num("PHSE") / 360.0
     x = (t / period + ph) % 1.0                 # phase within a cycle, 0..1
 
@@ -1203,8 +1215,12 @@ class App:
         ttk.Entry(r2, textvariable=self.arb_name, width=14).pack(side="left", padx=4)
         ttk.Label(r2, text="to CH:").pack(side="left", padx=(8, 0))
         self.arb_ch = tk.StringVar(value="2")
-        ttk.Combobox(r2, textvariable=self.arb_ch, values=[str(c) for c in CHANNELS],
-                     width=3, state="readonly").pack(side="left", padx=4)
+        chbox = ttk.Combobox(r2, textvariable=self.arb_ch,
+                             values=[str(c) for c in CHANNELS], width=3,
+                             state="readonly")
+        chbox.pack(side="left", padx=4)
+        # The pending trace takes its colour and its timebase from this channel.
+        chbox.bind("<<ComboboxSelected>>", lambda e: self.draw_preview())
         self.norm = tk.BooleanVar(value=True)
         ttk.Checkbutton(r2, text="normalise to full scale", variable=self.norm,
                         command=self.draw_preview).pack(side="left", padx=8)
@@ -1297,7 +1313,7 @@ class App:
         ch = int(self.arb_ch.get())
         self.vars[f"C{ch}:BSWV:WVTP"].set("ARB")
         self.vars[f"C{ch}:ARWV:NAME"].set(name)
-        self.preview_ch.set(f"CH{ch}")
+        self.show_ch[ch].set(True)
         self.log(f"CH{ch} set to '{name}' - press Apply changes to send it")
 
     def build_setups(self, parent, pad):
@@ -1342,19 +1358,33 @@ class App:
             return
         self.fig = Figure(figsize=(5.6, 3.0), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.fig.subplots_adjust(left=0.15, right=0.97, top=0.90, bottom=0.18)
+        # A second y axis made once and hidden when not wanted: building a fresh
+        # twinx on every redraw would stack up axes for the life of the session.
+        self.ax2 = self.ax.twinx()
+        self.ax2.set_visible(False)
+        self.fig.subplots_adjust(left=0.14, right=0.86, top=0.90, bottom=0.18)
         self.canvas = FigureCanvasTkAgg(self.fig, master=f)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
 
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Label(r, text="Show:").pack(side="left")
-        self.preview_ch = tk.StringVar(value="1")
-        cb = ttk.Combobox(r, textvariable=self.preview_ch,
-                          values=[f"CH{c}" for c in CHANNELS] + ["pending"],
-                          width=9, state="readonly")
-        cb.pack(side="left", padx=4)
-        cb.bind("<<ComboboxSelected>>", lambda e: self.draw_preview())
+        self.show_ch = {}
+        for ch in CHANNELS:
+            var = tk.BooleanVar(value=True)
+            self.show_ch[ch] = var
+            box = tk.Checkbutton(r, text=f"CH{ch}", variable=var,
+                                 command=self.draw_preview,
+                                 foreground=CH_COLOUR[ch],
+                                 activeforeground=CH_COLOUR[ch],
+                                 selectcolor="white")
+            box.pack(side="left", padx=(4, 0))
+        self.show_pending = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r, text="pending", variable=self.show_pending,
+                        command=self.draw_preview).pack(side="left", padx=(8, 0))
+        self.split_y = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r, text="separate Y axes", variable=self.split_y,
+                        command=self.draw_preview).pack(side="right")
 
     # -- helpers -----------------------------------------------------------
 
@@ -1786,7 +1816,7 @@ class App:
             self.log(f"  {self.arb_table.shape[0]} rows x {ncols} columns"
                      + (f": {', '.join(names)}" if names else ""))
         if self.canvas is not None:
-            self.preview_ch.set("pending")     # show what is about to go up
+            self.show_pending.set(True)        # show what is about to go up
         self.pick_column()
 
     def pick_column(self):
@@ -1984,87 +2014,136 @@ class App:
         tarb = self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB"
         return ("steps-post", "held") if tarb else ("default", "interpolated")
 
-    def draw_pending(self):
-        """The samples waiting to be uploaded, drawn as they will be stored:
-        sample index across, full scale of the DAC up the side. The volts they
-        come out at are set later by Ampl and Offset on the channel."""
-        self.ax.clear()
-        data = self.arb_samples
-        if data is None or data.size < 2:
-            self.ax.text(0.5, 0.5, "nothing built or loaded yet\n"
-                                   "use Build, or Load file, or Type/paste values",
-                         ha="center", va="center", transform=self.ax.transAxes,
-                         color="#666")
-            self.ax.set_xticks([])
-            self.ax.set_yticks([])
-        else:
-            peak = float(np.max(np.abs(data))) or 1.0
-            shown = data / peak if self.norm.get() else np.clip(data, -1.0, 1.0)
-            # Thin a long record down for drawing; 4000 points is well past what
-            # the canvas can resolve and keeps a 1 Mpt build responsive.
-            step = max(1, shown.size // 4000)
-            xs = np.arange(0, shown.size, step)
-            ys = shown[::step]
-            # The DAC holds each sample until the next one, so the trace is a
-            # staircase. Drawing it sloped would promise an interpolation the
-            # generator does not do - which is invisible on a smooth 50k record
-            # but is the whole shape of a ten-value list.
-            style, how = self.arb_style(int(self.arb_ch.get()))
-            if style == "steps-post":
-                # steps-post has no segment after the final point, so the last
-                # sample's dwell would be missing without one more step.
-                xs = np.append(xs, xs[-1] + step)
-                ys = np.append(ys, ys[-1])
-            marker = dict(marker="o", ms=3) if shown.size <= 400 else {}
-            self.ax.plot(xs, ys, drawstyle=style, lw=0.9, **marker)
-            self.ax.axhline(0.0, color="#999", lw=0.5)
-            self.ax.set_xlabel("sample")
-            self.ax.set_ylabel("fraction of full scale")
-            self.ax.set_ylim(-1.08, 1.08)
-            self.ax.grid(alpha=0.3)
-            self.ax.set_title(f"{os.path.basename(self.arb_source)} - "
-                              f"{data.size} pts, CH{self.arb_ch.get()} {how}"
-                              + ("" if self.norm.get() else ", not normalised"),
-                              fontsize=9)
-        self.canvas.draw_idle()
-
-    def draw_preview(self):
-        if self.canvas is None:
-            return
-        if self.preview_ch.get() == "pending":
-            return self.draw_pending()
-        ch = int(self.preview_ch.get().lstrip("CH") or 1)
+    def trace_for(self, ch, span):
+        """One channel's curve over a shared time window, or None."""
         wvtp = self.vars[f"C{ch}:BSWV:WVTP"].get().strip().upper()
         vals = {key: self.vars[f"C{ch}:BSWV:{key}"].get().strip()
                 for key, _, _ in WAVE_PARAMS}
-        # Follow the arb the channel actually has selected, not whatever was
-        # built last: switching the Arb wave dropdown has to change the picture,
-        # and showing the wrong samples is worse than showing none.
         name = self.vars[f"C{ch}:ARWV:NAME"].get().strip()
         arb = self.known_waves.get(name) if wvtp == "ARB" else None
-        style, how = self.arb_style(ch) if arb is not None else ("default", "")
-        curve = preview_curve(wvtp, vals, arb=arb, hold=style == "steps-post")
-
-        self.ax.clear()
+        hold = self.arb_style(ch)[0] == "steps-post"
+        curve = preview_curve(wvtp, vals, arb=arb, hold=hold, span=span,
+                              period=self.channel_period(ch))
         if curve is None:
-            msg = ("select a wave type" if not wvtp else
-                   f"CH{ch}: '{name}' is stored on the generator, and its samples\n"
-                   "cannot be read back. Build or load it here to preview it.")
-            self.ax.text(0.5, 0.5, msg, ha="center", va="center",
-                         transform=self.ax.transAxes, color="#666")
-            self.ax.set_xticks([])
-            self.ax.set_yticks([])
-        else:
+            return None, (f"CH{ch} {wvtp} '{name}' not held locally"
+                          if wvtp == "ARB" else f"CH{ch} {wvtp}")
+        label = f"CH{ch} {wvtp}"
+        if arb is not None:
+            # Say which way the clock joins the points up: it changes the shape
+            # on screen, so the trace should carry it rather than leaving the
+            # reader to check the Clock cell.
+            label += f" '{name}' ({'held' if hold else 'interpolated'})"
+        return curve, label
+
+    def channel_period(self, ch):
+        """Repeat time of whatever the channel is set to, in seconds."""
+        try:
+            freq = float(self.vars[f"C{ch}:BSWV:FRQ"].get().strip() or 0)
+        except ValueError:
+            freq = 0.0
+        return 1.0 / freq if freq > 0 else 1e-3
+
+    def pending_period(self, ch, n_points):
+        """How long the pending record would last on the channel it is aimed at.
+
+        Under TrueArb that is points / sample rate, which is knowable exactly
+        and is *not* the channel's present frequency - loading a record of a
+        different length changes the frequency. Under DDS the record is one
+        period whatever its length, so the channel's frequency stands.
+        """
+        if self.vars[f"C{ch}:SRATE:MODE"].get().strip() == "TARB":
+            try:
+                rate = float(self.vars[f"C{ch}:SRATE:VALUE"].get().strip() or 0)
+            except ValueError:
+                rate = 0.0
+            if rate > 0:
+                return n_points / rate
+        return self.channel_period(ch)
+
+    def draw_preview(self):
+        """Every enabled trace on one shared time axis.
+
+        Channels are drawn over a common window because they are simultaneous on
+        the bench; giving each its own window would imply an alignment that does
+        not exist. The pending waveform is drawn as it would come out of the
+        channel it is aimed at, in that channel's colour but dashed.
+        """
+        if self.canvas is None:
+            return
+        self.ax.clear()
+        self.ax2.clear()
+        # clear() puts a twinned axis's label back on the left, where it lands on
+        # top of the first axis's label. The ticks survive; the label does not.
+        self.ax2.yaxis.set_label_position("right")
+        self.ax2.yaxis.set_ticks_position("right")
+
+        wanted = [ch for ch in CHANNELS if self.show_ch[ch].get()]
+        target = int(self.arb_ch.get())
+        pending = (self.arb_samples if self.show_pending.get()
+                   and self.arb_samples is not None else None)
+
+        periods = [self.channel_period(ch) for ch in wanted]
+        if pending is not None:
+            periods.append(self.pending_period(target, pending.size))
+        if not periods:
+            self.ax.text(0.5, 0.5,
+                         "nothing selected" + chr(10) +
+                         "tick CH1, CH2 or pending",
+                         ha="center", va="center", transform=self.ax.transAxes,
+                         color="#666")
+            self.ax.set_xticks([]); self.ax.set_yticks([])
+            self.ax2.set_visible(False)
+            self.canvas.draw_idle()
+            return
+
+        span = 2.0 * max(periods)
+        # Two y axes only earn their keep when there are two channels to
+        # separate; with one trace it is just a duplicated scale.
+        split = self.split_y.get() and len(wanted) == 2
+        self.ax2.set_visible(split)
+
+        handles, notes = [], []
+        for ch in wanted:
+            axis = self.ax2 if (split and ch == 2) else self.ax
+            curve, label = self.trace_for(ch, span)
+            if curve is None:
+                notes.append(label)
+                continue
             t, v = curve
-            # Straight lines throughout: for an arb the staircase (or the
-            # ramp) is already in the resampled points, so a step drawstyle here
-            # would step an second time.
-            self.ax.plot(t * 1e3, v, lw=1.0)
-            self.ax.set_xlabel("time (ms)")
-            self.ax.set_ylabel("volts")
-            self.ax.grid(alpha=0.3)
-            src = f"  '{name}' ({arb.size} pts, {how})" if arb is not None else ""
-            self.ax.set_title(f"CH{ch}  {wvtp}{src}", fontsize=9)
+            handles += axis.plot(t * 1e3, v, lw=1.1, color=CH_COLOUR[ch],
+                                 label=label)
+
+        if pending is not None:
+            axis = self.ax2 if (split and target == 2) else self.ax
+            vals = {key: self.vars[f"C{target}:BSWV:{key}"].get().strip()
+                    for key, _, _ in WAVE_PARAMS}
+            hold = self.arb_style(target)[0] == "steps-post"
+            curve = preview_curve("ARB", vals, arb=pending, hold=hold, span=span,
+                                  period=self.pending_period(target, pending.size))
+            if curve is not None:
+                t, v = curve
+                handles += axis.plot(
+                    t * 1e3, v, lw=1.2, ls="--", color=CH_COLOUR[target],
+                    label=f"pending -> CH{target} ({pending.size} pts, "
+                          f"{'held' if hold else 'interpolated'})")
+
+        self.ax.set_xlabel("time (ms)")
+        self.ax.grid(alpha=0.3)
+        if split:
+            self.ax.set_ylabel("CH1 volts", color=CH_COLOUR[1])
+            self.ax2.set_ylabel("CH2 volts", color=CH_COLOUR[2])
+            self.ax.tick_params(axis="y", colors=CH_COLOUR[1])
+            self.ax2.tick_params(axis="y", colors=CH_COLOUR[2])
+        else:
+            self.ax.set_ylabel("volts", color="black")
+            self.ax.tick_params(axis="y", colors="black")
+        if handles:
+            self.ax.legend(handles, [h.get_label() for h in handles],
+                           fontsize=7, loc="upper right", framealpha=0.85)
+        if notes:
+            self.ax.set_title(" | ".join(notes), fontsize=8, color="#666")
+        else:
+            self.ax.set_title("")
         self.canvas.draw_idle()
 
     # -- config ------------------------------------------------------------
