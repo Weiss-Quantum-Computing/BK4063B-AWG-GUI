@@ -38,7 +38,10 @@ This is the one place where a generator panel differs from a capture tool: a wro
 click here puts a voltage into something.
 
 - **Apply changes**, **Recall setup** and closing the window never touch an output
-  switch. Only the **ON** / **OFF** buttons do.
+  switch. Only the **ON** / **OFF** buttons do - per channel in its own row, or
+  **Both ON** / **Both OFF** beside **Connect** for an experiment that wants the
+  two switched as one. The pair asks once rather than twice, and quotes both
+  channels.
 - **confirm before switching an output on** (on by default) puts a confirmation in
   front of anything that changes what a live channel is emitting: switching an
   output on, applying to a channel that is already on, or uploading an arb to one.
@@ -748,7 +751,21 @@ drive the instrument from your own scripts.
 - **`ARWV` and `SRATE` both force `WVTP,ARB`.** Selecting an arb or touching the
   sample-clock mode rewrites the wave type, so both must precede `BSWV`.
 - **`BSWV` clears active modulation**, so the carrier must be set before the mode
-  block, never after.
+  block, never after. It clears sweep and burst too, which is why setting an
+  amplitude on a channel running a burst used to switch the burst off. The mode
+  blocks carry the carrier's own settings for exactly this reason, so a channel
+  running a mode sends its carrier as `CARR,<key>,<value>` inside the mode block
+  and never stops:
+
+  ```
+  C1:BTWV PRD,0.01,TIME,3,GATE_NCYC,NCYC,TRSR,INT,CARR,WVTP,SINE,AMP,2
+  ```
+
+  `CARR` takes `WVTP`, `FRQ`, `PHSE`, `AMP`, `OFST`, `SYM`, `DUTY`, `RISE`,
+  `FALL`, `DLY`, `STDEV` and `MEAN`. It does **not** take `PERI`, `HLEV` or
+  `LLEV` - measured, because it accepts them and quietly ignores them. Driving
+  the levels or the period from that side therefore still needs a `BSWV`, and
+  the mode block that follows switches the mode back on.
 - **`MDWV STATE,ON` and the type tag must be separate commands.** Combined, as in
   `MDWV STATE,ON,FM,...`, the instrument applies the state and drops the type
   switch, leaving you on the previous modulation.

@@ -130,6 +130,15 @@ SOURCES = ("INT", "EXT")
 # modes take any of SINE/SQUARE/RAMP/ARB.
 PWM_CARRIER = "PULSE"
 
+# Carrier settings a mode block will accept as CARR,<key>,<value>, so they can
+# be changed without a BSWV write - which switches modulation, sweep and burst
+# straight off. Measured on the instrument, because the difference is silent:
+# AMP, FRQ, OFST, PHSE and DUTY all take and leave a burst running, while
+# CARR,PERI, CARR,HLEV and CARR,LLEV are accepted and quietly ignored. The rest
+# are from the programming guide's own CARR table.
+CARR_KEYS = {"WVTP", "FRQ", "PHSE", "AMP", "OFST", "SYM", "DUTY",
+             "RISE", "FALL", "DLY", "STDEV", "MEAN"}
+
 # Sweep and burst are not available while a channel's sample clock is TrueArb.
 # Measured, not inferred: BTWV STATE,ON and SWWV STATE,ON both read back OFF
 # under TARB and ON under DDS, reproducibly, while MDWV is unaffected. The
@@ -1659,12 +1668,23 @@ class Awg:
                 send(f"{prefix}:SRATE {args}")
 
         bswv = blocks.get("BSWV") or {}
+        carrier_type = bswv.get("WVTP")
+        # BSWV switches modulation, sweep and burst off - which is why setting
+        # an amplitude used to take a burst with it. The mode blocks carry the
+        # carrier's own settings for exactly this reason, so when everything
+        # being changed can go that way, it does, and the mode never stops.
+        # Anything CARR will not take still needs BSWV, and the mode block
+        # below then puts the mode back.
+        carried = {}
+        active = blocks.get("MODE") and blocks["MODE"][0] != "Off"
+        if bswv and active and set(bswv) <= CARR_KEYS:
+            carried, bswv = bswv, {}
         if bswv:
             args = ",".join(f"{k},{v}" for k, v in bswv.items() if v != "")
             if args:
                 send(f"{prefix}:BSWV {args}")
 
-        if bswv.get("WVTP") == "ARB" and srate.get("MODE") == "TARB":
+        if carrier_type == "ARB" and srate.get("MODE") == "TARB":
             # TrueArb quantises its clock against the loaded waveform, so the
             # pre-BSWV write lands a few ppm off. Re-asserting it afterwards is
             # only safe here because SRATE forces WVTP,ARB - which is what this
@@ -1685,6 +1705,9 @@ class Awg:
                 # rather than merely tidy.
                 send(f"{prefix}:{verb} STATE,ON")
                 args = ",".join(f"{k},{v}" for k, v in params.items() if v != "")
+                carr = ",".join(f"{k},{v}" for k, v in carried.items() if v != "")
+                if carr:
+                    args = f"{args},CARR,{carr}" if args else f"CARR,{carr}"
                 lead = f"{mode}," if verb == "MDWV" else ""
                 if lead or args:
                     send(f"{prefix}:{verb} {lead}{args}")
@@ -1857,6 +1880,16 @@ class App:
         ttk.Button(top, text="Connect", command=self.do_connect).pack(side="right")
         ttk.Button(top, text="Load/save setups...",
                    command=self.do_setups).pack(side="right", padx=(0, 6))
+        # Both channels together, for the common case of an experiment that
+        # wants them switched as one. Each still has its own pair in its panel.
+        self.both_off_btn = ttk.Button(top, text="Both OFF", width=9,
+                                       command=lambda: self.toggle_both(False),
+                                       state="disabled")
+        self.both_off_btn.pack(side="right", padx=(0, 6))
+        self.both_on_btn = ttk.Button(top, text="Both ON", width=9,
+                                      command=lambda: self.toggle_both(True),
+                                      state="disabled")
+        self.both_on_btn.pack(side="right")
 
         # --- one panel per channel
         for ch in CHANNELS:
@@ -1934,8 +1967,12 @@ class App:
         # tuple -> dropdown that is also typeable, for the arb name, whose
         # suggestions are filled in from the generator once it is read.
         if choices is not None:
+            # Deep enough for the whole list. At the default ten, Burst - the
+            # eleventh mode - could only be reached by scrolling, which is not
+            # something anyone thinks to try on a dropdown that looks complete.
             w = ttk.Combobox(halo, textvariable=var, values=list(choices),
                              width=max(4, width - 3),
+                             height=min(len(choices), 24) if choices else 10,
                              state="readonly" if choices else "normal")
         else:
             w = ttk.Entry(halo, textvariable=var, width=width)
@@ -2075,7 +2112,7 @@ class App:
         ttk.Label(r, text="Shape:").pack(side="left")
         self.shape = tk.StringVar(value="Gaussian")
         cb = ttk.Combobox(r, textvariable=self.shape, values=list(BUILD_SHAPES),
-                          width=17, state="readonly")
+                          width=17, height=len(BUILD_SHAPES), state="readonly")
         cb.pack(side="left", padx=4)
         cb.bind("<<ComboboxSelected>>", lambda e: self.on_shape())
         self.build_len_label = ttk.Label(r, text="Points:")
@@ -2491,6 +2528,7 @@ class App:
                 if key == "shape":
                     widget = ttk.Combobox(self.seq_body, textvariable=var,
                                           values=seq_shapes(), width=width,
+                                          height=len(seq_shapes()),
                                           state="readonly")
                 else:
                     widget = ttk.Entry(self.seq_body, textvariable=var,
@@ -3405,6 +3443,8 @@ class App:
         for ch in CHANNELS:
             getattr(self, f"on_btn{ch}").configure(state=state)
             getattr(self, f"off_btn{ch}").configure(state=state)
+        for btn in (self.both_on_btn, self.both_off_btn):
+            btn.configure(state=state)
         self.upload_btn.configure(
             state="normal" if live and self.arb_samples is not None else "disabled")
 
@@ -3544,9 +3584,14 @@ class App:
 
         mode = self.vars[f"C{ch}:MODE"].get().strip() or "Off"
         slots = [f"C{ch}:MODE:{s}" for s in range(MODE_SLOTS)]
-        if self.edited(f"C{ch}:MODE") or any(
-                self.edited(k) and str(self.widgets[k].cget("state")) != "disabled"
-                for k in slots):
+        touched = self.edited(f"C{ch}:MODE") or any(
+            self.edited(k) and str(self.widgets[k].cget("state")) != "disabled"
+            for k in slots)
+        # A channel running a mode sends its mode block whenever the carrier
+        # changes, even if the mode row itself was not touched: the block is
+        # what carries the new carrier settings, and what puts the mode back on
+        # if they had to go the long way round.
+        if touched or (mode != "Off" and "BSWV" in blocks):
             params = {}
             for slot in range(MODE_SLOTS):
                 key = self.mode_key(ch, slot)
@@ -3742,6 +3787,40 @@ class App:
                          f"{freq:g} Hz")
         except Exception:
             pass                      # a log line is never worth failing over
+
+    def toggle_both(self, on):
+        """Switch both outputs together, asking once rather than twice."""
+        if self.busy or not self.awg.inst:
+            return
+        if on and self.confirm_output.get():
+            lines = []
+            for ch in CHANNELS:
+                wave = self.vars[f"C{ch}:BSWV:WVTP"].get().strip() or "?"
+                amp = self.vars[f"C{ch}:BSWV:AMP"].get().strip() or "?"
+                freq = self.vars[f"C{ch}:BSWV:FRQ"].get().strip() or "?"
+                load = self.vars[f"C{ch}:OUTP:LOAD"].get().strip() or "?"
+                lines.append(f"    CH{ch}:  {wave}   {freq} Hz   {amp} Vpp"
+                             f"   into {load} ohm")
+            if not messagebox.askokcancel(
+                    "Switch BOTH outputs ON?",
+                    "Both channels will start driving whatever is "
+                    "connected:\n\n" + "\n".join(lines) + "\n\n"
+                    "These are the generator's own last-read settings, not any "
+                    "unapplied edit in the panel."):
+                return
+        self.set_busy(True)
+
+        def work():
+            try:
+                for ch in CHANNELS:
+                    self.awg.set_output(ch, on)
+                blocks = {ch: self.awg.read_channel(ch) for ch in CHANNELS}
+                self.log(f"Both outputs {'ON' if on else 'OFF'}")
+                self.root.after(0, lambda: self.after_read(blocks))
+            except Exception as exc:
+                self.log(f"ERROR: {exc}")
+                self.root.after(0, lambda: self.set_busy(False))
+        threading.Thread(target=work, daemon=True).start()
 
     def toggle_output(self, ch, on):
         if self.busy or not self.awg.inst:
