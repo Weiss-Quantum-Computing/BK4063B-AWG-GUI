@@ -70,6 +70,23 @@ def _lighten(colour, amount):
     return "#%02x%02x%02x" % tuple(mix)
 
 
+# One button per output, coloured by what that output is actually doing. Two
+# buttons that always looked identical, with the state written in a label
+# beside them, meant reading the panel rather than glancing at it. Red is live.
+# The colour carries the state and the word repeats it, so neither the colour
+# nor the text has to be trusted on its own.
+#
+# Switching ON is the direction that can put a voltage into something, and it
+# still asks first - so a mis-click on a state-showing toggle can only ever
+# turn an output off, which is the harmless direction.
+OUT_LOOK = {
+    "ON":    ("#c62828", "ON"),
+    "OFF":   ("#2e7d32", "OFF"),
+    "MIXED": ("#c68000", "MIXED"),
+    None:    ("#8a8a8a", "?"),
+}
+
+
 # The pending trace is the channel it is aimed at, but not yet: a paler shade
 # of that channel's colour says both at once, where the same colour dashed left
 # it looking like the channel's own trace drawn twice.
@@ -86,6 +103,24 @@ WAVE_TYPES = ("SINE", "SQUARE", "RAMP", "PULSE", "NOISE", "DC", "ARB")
 LOADS = ("50", "HZ")
 
 BAD_NAME_CHARS = r'<>:"/\|?*'
+
+# The longest waveform name this app will send. Measured at the front panel:
+# the generator stores an upload as <name>.bin and takes that stored name at 15
+# characters but not at 16 - so what is typed here gets 15 less the four the
+# generator appends, and 11 is the last length that works.
+#
+# Past it the generator refuses nothing. The upload lands, the right waveform
+# is selected and played, and then the front panel locks solid - no buttons, no
+# USB, power cycle to recover. That is what a 28- and a 29-character name each
+# did, which is why this is a cap in the entry box rather than a warning that
+# can be waved through.
+MAX_ARB_NAME = 11
+
+# How wide the Arb wave box is, in characters. Sized to reach across the three
+# parameter columns above it, since a ttk combobox's drop-down list is exactly
+# as wide as the box - and a name clipped in that list is a waveform you have
+# to choose blind.
+ARB_BOX = 68
 
 # Widgets that already use Space/arrows themselves, so the global shortcuts stay
 # out of their way - typing in the prefix box must not toggle an output.
@@ -868,28 +903,55 @@ def format_sequence_spec(segments, rate, unit="us", baseline="0",
     return "\n".join(lines) + "\n"
 
 
-def parse_pasted(text):
-    """Read typed or pasted numbers into (2-D array, column names or None).
+def _split_fields(line):
+    """One line of a table into its fields, trailing empty ones dropped.
 
-    Same contract as read_table, so pasted data goes through the same column
-    picker: rows split on newlines, columns on commas, semicolons or whitespace.
-    A first row that is not numeric is taken as the column names.
+    A spreadsheet asked to save a one-column sheet writes `0,,,` - the empty
+    cells of columns it was never given. Those are not columns, and reading
+    them as data is what made a rescaled waveform unloadable while the
+    unrescaled one beside it was fine. An empty field *between* two real ones
+    is a hole in the data rather than a stray comma, so it is left to fail
+    loudly instead of silently shifting every column after it.
+    """
+    if any(sep in line for sep in ",;	"):
+        fields = [f.strip().strip('"') for f in re.split(r"[,;	]", line)]
+    else:
+        fields = [f.strip().strip('"') for f in line.split()]
+    while fields and fields[-1] == "":
+        fields.pop()
+    return fields
+
+
+def _table_from_lines(lines, source="the data"):
+    """Lines of a delimited table into (2-D array, column names or None).
+
+    The one reader behind both a pasted block and a text file, so the two
+    cannot drift apart: blank lines and # comments skipped, columns split on
+    commas, semicolons, tabs or whitespace, and a first row that will not parse
+    as numbers taken as the column names.
     """
     rows, names = [], None
-    for line in text.strip().splitlines():
-        line = line.strip().lstrip("﻿")
+    for raw in lines:
+        line = raw.strip().lstrip("﻿")
         if not line or line.startswith("#"):
             continue
-        fields = [f for f in re.split(r"[,;\s]+", line) if f]
+        fields = _split_fields(line)
+        if not fields:
+            continue
         try:
             rows.append([float(f) for f in fields])
         except ValueError:
             if not rows and names is None:
-                names = [f.strip('"') for f in fields]
+                names = fields
                 continue
-            raise ValueError(f"cannot read this as numbers: {line[:60]}")
+            raise ValueError(
+                f"cannot read this line of {source} as numbers: "
+                f"{line[:60]}")
     if not rows:
-        raise ValueError("no numbers found")
+        raise ValueError(
+            f"no numbers found in {source} - this does not look like sample "
+            f"data. A saved setup is a .json; the .txt beside it is a summary "
+            f"to read, not a waveform.")
 
     width = len(rows[0])
     if any(len(r) != width for r in rows):
@@ -900,6 +962,16 @@ def parse_pasted(text):
     if data.shape[0] == 1 and data.shape[1] > 2:
         data, names = data.T, None
     return data, names
+
+
+def parse_pasted(text):
+    """Read typed or pasted numbers into (2-D array, column names or None).
+
+    Same contract as read_table, so pasted data goes through the same column
+    picker: rows split on newlines, columns on commas, semicolons or whitespace.
+    A first row that is not numeric is taken as the column names.
+    """
+    return _table_from_lines(text.splitlines(), "what was pasted")
 
 
 # Column headings that are an x-axis rather than samples, so a file written as
@@ -928,16 +1000,20 @@ def read_table(path):
             data = data.reshape(-1, 1)
         return data, None
 
+    # numpy first, because it reads a big clean file an order of magnitude
+    # faster than Python can, and most files are clean. Anything it will not
+    # take goes to the tolerant reader rather than to the user: it used to
+    # guess that a failure meant a header row and re-read with skiprows=1,
+    # which turned "this is not sample data" into a numpy complaint about
+    # whatever word happened to sit at row 0, column 1.
     delim = "," if path.lower().endswith(".csv") else None
-    names = None
     try:
-        data = np.loadtxt(path, delimiter=delim, ndmin=2)
-    except ValueError:
+        data = np.asarray(np.loadtxt(path, delimiter=delim, ndmin=2,
+                                     comments="#"), dtype=np.float64)
+        names = None
+    except Exception:
         with open(path, encoding="utf-8-sig", errors="replace") as fh:
-            header = fh.readline()
-        names = [c.strip().strip('"') for c in header.split(delim or None)]
-        data = np.loadtxt(path, delimiter=delim, ndmin=2, skiprows=1)
-    data = np.asarray(data, dtype=np.float64)
+            return _table_from_lines(fh.readlines(), os.path.basename(path))
 
     # A single row of many values is a waveform written across the line, not a
     # one-sample capture of many channels.
@@ -1005,7 +1081,17 @@ def cache_read(path):
         with open(path, encoding="utf-8", errors="replace") as fh:
             if CACHE_MARK not in fh.readline():
                 return None
-        return np.asarray(np.loadtxt(path, ndmin=1), dtype=np.float64).ravel()
+        try:
+            return np.asarray(np.loadtxt(path, ndmin=1),
+                              dtype=np.float64).ravel()
+        except Exception:
+            # One of ours that has been round a spreadsheet since. The header
+            # says it is a cache file, so it is read as one rather than being
+            # dropped for the trailing commas Excel left behind.
+            with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                data, _ = _table_from_lines(fh.readlines(),
+                                            os.path.basename(path))
+            return np.asarray(data[:, 0], dtype=np.float64).ravel()
     except Exception:
         return None                   # a damaged entry is not worth a crash
 
@@ -1808,6 +1894,7 @@ class App:
         self.arb_table = None         # every column of that file, for the picker
         self.arb_element = None       # the last built/loaded/pasted waveform,
                                       # kept so a train is never built on a train
+        self.arb_index = 0            # which column of that file holds them
         migrated = cache_migrate()        # anything still kept as .npy
         self.known_waves = cache_load()   # name -> samples, from earlier sessions
         if migrated:
@@ -1817,6 +1904,12 @@ class App:
         self.device_waves = []        # what the generator last said it holds
         self.arb_source = ""
         self.read_stamp = ""
+        # Where Load file... opens. The local copies are the files most likely
+        # to be wanted, and the dialog used to open on whatever folder was last
+        # touched - which after one Save setup was the setups folder, where
+        # picking the readable .txt summary got a numpy complaint about the
+        # word `instrument` rather than anything useful.
+        self.wave_dir = WAVE_CACHE
 
         # panel key -> widgets/state, exactly one entry per editable cell
         self.vars = {}                # key -> StringVar shown in the panel
@@ -1849,7 +1942,7 @@ class App:
             os.path.expanduser("~"), "Desktop", "awg_setups"))
         self.prefix = tk.StringVar(value="awg")
         self.confirm_output = tk.BooleanVar(value=True)
-        self.save_btn = self.recall_btn = None
+        self.save_btn = self.recall_btn = self.mem_btn = None
 
         self.seq_win = None
         self.seq_data = [dict(SEQ_DEFAULT)]
@@ -1887,15 +1980,13 @@ class App:
         ttk.Button(top, text="Load/save setups...",
                    command=self.do_setups).pack(side="right", padx=(0, 6))
         # Both channels together, for the common case of an experiment that
-        # wants them switched as one. Each still has its own pair in its panel.
-        self.both_off_btn = ttk.Button(top, text="Both OFF", width=9,
-                                       command=lambda: self.toggle_both(False),
-                                       state="disabled")
-        self.both_off_btn.pack(side="right", padx=(0, 6))
-        self.both_on_btn = ttk.Button(top, text="Both ON", width=9,
-                                      command=lambda: self.toggle_both(True),
-                                      state="disabled")
-        self.both_on_btn.pack(side="right")
+        # wants them switched as one. Each still has its own in its panel.
+        self.both_btn = tk.Button(top, width=11, borderwidth=2,
+                                  font=("Segoe UI", 9, "bold"),
+                                  command=self.flip_both, state="disabled")
+        self.both_btn.pack(side="right", padx=(0, 6))
+        ttk.Label(top, text="Both:").pack(side="right", padx=(0, 4))
+        self.paint_output(self.both_btn, None, "BOTH ")
 
         # --- one panel per channel
         for ch in CHANNELS:
@@ -2008,19 +2099,13 @@ class App:
         o = ttk.Frame(f)
         o.pack(fill="x", padx=6, pady=(6, 2))
         ttk.Label(o, text="Output:").pack(side="left")
-        lamp = ttk.Label(o, text="?", width=5, foreground="#666")
-        lamp.pack(side="left", padx=(4, 8))
-        setattr(self, f"lamp{ch}", lamp)
-        on_btn = ttk.Button(o, text="ON", width=5,
-                            command=lambda c=ch: self.toggle_output(c, True),
-                            state="disabled")
-        on_btn.pack(side="left")
-        off_btn = ttk.Button(o, text="OFF", width=5,
-                             command=lambda c=ch: self.toggle_output(c, False),
-                             state="disabled")
-        off_btn.pack(side="left", padx=4)
-        setattr(self, f"on_btn{ch}", on_btn)
-        setattr(self, f"off_btn{ch}", off_btn)
+        btn = tk.Button(o, width=7, borderwidth=2,
+                        font=("Segoe UI", 9, "bold"),
+                        command=lambda c=ch: self.flip_output(c),
+                        state="disabled")
+        btn.pack(side="left", padx=(4, 8))
+        setattr(self, f"out_btn{ch}", btn)
+        self.paint_output(btn, None)
         ttk.Label(o, text="Load:").pack(side="left", padx=(12, 0))
         # Typeable, not a fixed list: the generator takes any load from 50
         # ohm up, even though only these two appear on its own screen.
@@ -2036,6 +2121,22 @@ class App:
         ttk.Label(w, text="Wave:").grid(row=0, column=0, sticky="e", padx=(0, 4))
         self.cell(w, f"C{ch}:BSWV:WVTP", WAVE_TYPES, 0, 1, 11,
                   on_change=lambda c=ch: self.on_wave_type(c))
+        # The sample clock rides the top row, in the columns the parameters
+        # underneath it use: Sa/s over Offset, Low, Symmetry, Fall and Mean,
+        # and Clock over the column beside it. It is a setting like the rest
+        # and now reads as one, it fills a row that was three-quarters empty,
+        # and it leaves the row below entirely to the waveform name.
+        for col, (text, key, choices) in enumerate((
+                ("Clock:", f"C{ch}:SRATE:MODE", ("DDS", "TARB")),
+                ("Sa/s:", f"C{ch}:SRATE:VALUE", None)), start=1):
+            label = ttk.Label(w, text=text)
+            label.grid(row=0, column=col * 2, sticky="e", padx=(0, 4))
+            self.arb_labels[key] = label
+            # The clock decides whether Sa/s means anything, so it re-runs the
+            # same greying pass the wave type does.
+            self.cell(w, key, choices, 0, col * 2 + 1, 11,
+                      on_change=(lambda c=ch: self.on_wave_type(c))
+                      if key.endswith("SRATE:MODE") else None)
         for i, (key, label, _) in enumerate(WAVE_PARAMS):
             row, col = divmod(i, 3)
             row += 1
@@ -2044,24 +2145,17 @@ class App:
             setattr(self, f"lab{ch}_{key}", lab)
             self.cell(w, f"C{ch}:BSWV:{key}", None, row, col * 2 + 1, 11)
 
-        # --- arb selection and sample clock, only live for WVTP,ARB
+        # --- which stored waveform, only live for WVTP,ARB. A row of its own
+        # and the full width of the panel, because the dropdown's list is only
+        # as wide as the box it hangs off: at the old width a name was cut off
+        # in the very list it has to be recognised in.
         a = ttk.Frame(f)
         a.pack(fill="x", padx=6, pady=2)
-        for col, (text, key, choices, width) in enumerate((
-                ("Arb wave:", f"C{ch}:ARWV:NAME", (), 16),
-                ("Clock:", f"C{ch}:SRATE:MODE", ("DDS", "TARB"), 8),
-                ("Sa/s:", f"C{ch}:SRATE:VALUE", None, 11))):
-            label = ttk.Label(a, text=text)
-            label.grid(row=0, column=col * 2, sticky="e",
-                       padx=((0, 4) if col == 0 else (8, 4)))
-            self.arb_labels[key] = label
-            # The clock decides whether Sa/s and Interp mean anything, so it
-            # re-runs the same greying pass the wave type does.
-            widget = self.cell(a, key, choices, 0, col * 2 + 1, width,
-                               on_change=(lambda c=ch: self.on_wave_type(c))
-                               if key.endswith("SRATE:MODE") else None)
-            if key.endswith("ARWV:NAME"):
-                setattr(self, f"arbcombo{ch}", widget)
+        arb_key = f"C{ch}:ARWV:NAME"
+        label = ttk.Label(a, text="Arb wave:")
+        label.grid(row=0, column=0, sticky="e", padx=(0, 4))
+        self.arb_labels[arb_key] = label
+        setattr(self, f"arbcombo{ch}", self.cell(a, arb_key, (), 0, 1, ARB_BOX))
 
         # --- modulation / sweep / burst
         m = ttk.Frame(f)
@@ -2794,7 +2888,16 @@ class App:
         r2.pack(fill="x", padx=6, pady=(2, 6))
         ttk.Label(r2, text="Name:").pack(side="left")
         self.arb_name = tk.StringVar(value="wave2")
-        ttk.Entry(r2, textvariable=self.arb_name, width=14).pack(side="left", padx=4)
+        # Capped in the box rather than checked at upload, because the failure
+        # it prevents is not recoverable from the panel: a name past
+        # MAX_ARB_NAME uploads and plays correctly and then wedges the
+        # generator's front panel, and only a power cycle brings it back.
+        name_box = ttk.Entry(r2, textvariable=self.arb_name, width=MAX_ARB_NAME + 2)
+        name_box.configure(validate="key", validatecommand=(
+            name_box.register(lambda text: len(text) <= MAX_ARB_NAME), "%P"))
+        name_box.pack(side="left", padx=4)
+        ttk.Label(r2, text=f"(max {MAX_ARB_NAME})",
+                  foreground="#666").pack(side="left")
         ttk.Label(r2, text="to CH:").pack(side="left", padx=(8, 0))
         self.arb_ch = tk.StringVar(value="2")
         chbox = ttk.Combobox(r2, textvariable=self.arb_ch,
@@ -2805,7 +2908,7 @@ class App:
         chbox.bind("<<ComboboxSelected>>", lambda e: self.draw_preview())
         self.norm = tk.BooleanVar(value=True)
         ttk.Checkbutton(r2, text="normalise to full scale", variable=self.norm,
-                        command=self.draw_preview).pack(side="left", padx=8)
+                        command=self.on_norm).pack(side="left", padx=8)
         self.upload_btn = ttk.Button(r2, text="Upload", command=self.do_upload,
                                      state="disabled")
         self.upload_btn.pack(side="left", padx=4)
@@ -2825,8 +2928,8 @@ class App:
 
         row = ttk.Frame(f)
         row.pack(side="bottom", fill="x", padx=6, pady=2)
-        self.mem_btn = ttk.Button(row, text="Refresh", command=self.do_read,
-                                  state="disabled")
+        self.mem_btn = ttk.Button(row, text="Refresh",
+                                  command=self.do_refresh_memory)
         self.mem_btn.pack(side="left")
         ttk.Button(row, text="Forget local copy",
                    command=self.do_forget).pack(side="left", padx=6)
@@ -2842,6 +2945,37 @@ class App:
         self.mem_list.pack(side="left", fill="both", expand=True)
         sb.pack(side="left", fill="y")
 
+    def do_refresh_memory(self):
+        """Re-read both halves of this list: the generator, and the folder.
+
+        The folder half is the point of the change. Local copies were only ever
+        picked up at startup, so a waveform dropped into Waveforms/ - or
+        written there by a script, or pulled in with the project - stayed
+        invisible until the app was restarted, and the list went on saying
+        `no local copy` about a file sitting right there.
+
+        The folder is read whether or not a generator is attached, since that
+        half needs nothing but the disk.
+        """
+        if self.busy:
+            return
+        before = set(self.known_waves)
+        self.known_waves = cache_load()
+        added = sorted(set(self.known_waves) - before)
+        gone = sorted(before - set(self.known_waves))
+        if added:
+            self.log(f"Local copies picked up from {WAVE_CACHE}: "
+                     + ", ".join(added))
+        if gone:
+            self.log("Local copies no longer in the folder: " + ", ".join(gone))
+        if not added and not gone:
+            self.log(f"Local copies unchanged ({len(self.known_waves)} in "
+                     f"{WAVE_CACHE}).")
+        self.refresh_memory(self.device_waves)
+        self.draw_preview()
+        if self.awg.inst:
+            self.do_read()
+
     def refresh_memory(self, names):
         """Show what is on the generator and what we hold a local copy of."""
         self.device_waves = list(names or [])
@@ -2855,7 +2989,12 @@ class App:
         # front panel, or uploaded from another machine. Say so rather than
         # leaving a name that looks live.
         for name in sorted(set(self.known_waves) - set(self.device_waves)):
-            self.mem_list.insert("end", f"{name:<18}  local copy only")
+            # Same points column as the rows above: the length is a property of
+            # the copy we hold, so it reads out whether or not the generator
+            # still lists the name.
+            samples = self.known_waves[name]
+            self.mem_list.insert(
+                "end", f"{name:<18}{samples.size:>9,} pts  local copy only")
 
     def selected_wave(self):
         picked = self.mem_list.curselection()
@@ -3375,13 +3514,24 @@ class App:
         sample clock can each be the thing that just changed, and only on the
         way into the bad state - otherwise every later keystroke on the channel
         would raise the same box again.
+
+        The state is recorded before the box goes up, and the box itself is put
+        off to the idle loop. Both are needed. A modal dialog runs a nested
+        event loop, so raising one from inside a variable trace let the rest of
+        the combobox's own selection land while it was up - a second write, a
+        second trace, and with the state not yet recorded, a second identical
+        error box waiting behind the first. Deferring also lets the combobox
+        finish repainting, so the setting that caused the complaint is visible
+        in its box while the complaint is on screen rather than only after it.
         """
         problem = self.mode_problem(ch)
-        if problem and problem != self.pwm_bad[ch] and not self.loading:
-            title, message = problem
-            messagebox.showerror(title, message)
-            self.log(f"CH{ch}: {message.splitlines()[0]}")
+        fresh = problem and problem != self.pwm_bad[ch] and not self.loading
         self.pwm_bad[ch] = problem
+        if fresh:
+            title, message = problem
+            self.log(f"CH{ch}: {message.splitlines()[0]}")
+            self.root.after_idle(
+                lambda: messagebox.showerror(title, message))
 
     def burst_idle(self, ch):
         """What the output will sit at between bursts, in volts, or None.
@@ -3440,29 +3590,71 @@ class App:
         self.busy = busy
         live = bool(self.awg.inst) and not busy
         state = "normal" if live else "disabled"
-        buttons = [self.read_btn, self.apply_btn, self.mem_btn,
+        buttons = [self.read_btn, self.apply_btn,
                    self.save_btn, self.recall_btn]
         for btn in buttons:
             # Save and Recall live in a window that is usually not open.
             if btn is not None and btn.winfo_exists():
                 btn.configure(state=state)
         for ch in CHANNELS:
-            getattr(self, f"on_btn{ch}").configure(state=state)
-            getattr(self, f"off_btn{ch}").configure(state=state)
-        for btn in (self.both_on_btn, self.both_off_btn):
-            btn.configure(state=state)
+            getattr(self, f"out_btn{ch}").configure(state=state)
+        self.both_btn.configure(state=state)
+        # Refresh reads the local Waveforms folder as well as the generator,
+        # and that half works with nothing attached.
+        if self.mem_btn is not None:
+            self.mem_btn.configure(state="disabled" if busy else "normal")
+        self.repaint_outputs()
         self.upload_btn.configure(
             state="normal" if live and self.arb_samples is not None else "disabled")
 
-    def show_lamp(self, ch, state):
+    def paint_output(self, btn, state, prefix=""):
+        """Colour one output button by the state it is showing.
+
+        A disabled button is washed out rather than recoloured, so a panel with
+        no generator attached still says which way the outputs were left
+        without looking like it could be clicked.
+        """
+        colour, word = OUT_LOOK.get(state, OUT_LOOK[None])
+        if str(btn.cget("state")) == "disabled":
+            colour = _lighten(colour, 0.55)
+        btn.configure(text=prefix + word, bg=colour, fg="#ffffff",
+                      activebackground=_lighten(colour, 0.18),
+                      activeforeground="#ffffff", disabledforeground="#ffffff")
+
+    def repaint_outputs(self):
+        """Every output button's face, from what the generator last reported."""
+        states = [self.out_state.get(ch) for ch in CHANNELS]
+        for ch in CHANNELS:
+            btn = getattr(self, f"out_btn{ch}", None)
+            if btn is not None:
+                self.paint_output(btn, self.out_state.get(ch))
+        both = getattr(self, "both_btn", None)
+        if both is not None:
+            if None in states:
+                shown = None
+            elif len(set(states)) == 1:
+                shown = states[0]
+            else:
+                shown = "MIXED"
+            self.paint_output(both, shown, "BOTH ")
+
+    def flip_output(self, ch):
+        """One button, so the click means the other state."""
+        self.toggle_output(ch, self.out_state.get(ch) != "ON")
+
+    def flip_both(self):
+        """Both on only from both off. Anything else switches both off.
+
+        Deliberately not a plain inversion. From MIXED - or from a state that
+        has not been read yet - the safe move is the one that cannot put a
+        voltage into anything, so the odd cases go off rather than on.
+        """
+        self.toggle_both(all(self.out_state.get(c) == "OFF"
+                             for c in CHANNELS))
+
+    def show_output_state(self, ch, state):
         self.out_state[ch] = state
-        lamp = getattr(self, f"lamp{ch}")
-        if state == "ON":
-            lamp.configure(text="ON", foreground="#a00")
-        elif state == "OFF":
-            lamp.configure(text="OFF", foreground="#060")
-        else:
-            lamp.configure(text="?", foreground="#666")
+        self.repaint_outputs()
 
     # -- panel <-> instrument ---------------------------------------------
 
@@ -3554,7 +3746,8 @@ class App:
         # the complaint, so a panel read back in a bad state says so once.
         self.pwm_bad[ch] = self.mode_problem(ch)
 
-        self.show_lamp(ch, parse_reply(blocks.get("OUTP", "")).get("STATE"))
+        self.show_output_state(ch,
+                               parse_reply(blocks.get("OUTP", "")).get("STATE"))
         if kept:
             self.log(f"  (CH{ch}: kept {kept} unapplied edit(s))")
 
@@ -3860,12 +4053,14 @@ class App:
     # -- arbitrary waveform upload ----------------------------------------
 
     def pick_arb(self):
+        start = self.wave_dir if os.path.isdir(self.wave_dir) else "."
         path = filedialog.askopenfilename(
-            title="Waveform samples",
+            title="Waveform samples", initialdir=start,
             filetypes=[("Sample data", "*.csv *.txt *.dat *.npy"),
                        ("All files", "*.*")])
         if not path:
             return
+        self.wave_dir = os.path.dirname(path) or self.wave_dir
         try:
             table, names = read_table(path)
             if table.shape[0] < 2:
@@ -3891,7 +4086,7 @@ class App:
         self.arb_col_box.configure(values=labels,
                                    state="readonly" if ncols > 1 else "disabled")
         self.arb_col.set(labels[default_column(names, ncols)])
-        self.arb_name.set(safe_name(suggested)[:16] or "wave2")
+        self.arb_name.set(safe_name(suggested)[:MAX_ARB_NAME] or "wave2")
         if ncols > 1:
             self.log(f"  {self.arb_table.shape[0]} rows x {ncols} columns"
                      + (f": {', '.join(names)}" if names else ""))
@@ -3911,14 +4106,40 @@ class App:
         self.arb_samples = data
         self.arb_element = data
 
-        note = f"{os.path.basename(self.arb_source)} - {data.size} pts"
-        if self.arb_table.shape[1] > 1:
-            note += f", col {index + 1}"
-        self.arb_info.configure(text=note, foreground="#000")
+        self.arb_index = index
+        self.show_arb_info()
         self.log(f"  using column {index + 1}: {data.size} pts, "
                  f"{data.min():g} to {data.max():g}")
         self.set_busy(self.busy)
         self.draw_preview()
+
+    def on_norm(self):
+        """The normalise switch changes what will be sent, so say so at once."""
+        self.show_arb_info()
+        self.draw_preview()
+
+    def show_arb_info(self):
+        """The line beside Load file..., including a full-scale warning.
+
+        Said here rather than only in the upload dialog, so that a record which
+        will be flat-topped says so while there is still time to do something
+        about it.
+        """
+        if self.arb_samples is None:
+            self.arb_info.configure(text="no file loaded", foreground="#666")
+            return
+        data = self.arb_samples
+        note = f"{os.path.basename(self.arb_source)} - {data.size} pts"
+        if self.arb_table is not None and self.arb_table.shape[1] > 1:
+            note += f", col {self.arb_index + 1}"
+        peak = float(np.max(np.abs(data))) if data.size else 0.0
+        if not self.norm.get() and peak > 1.0:
+            over = int(np.count_nonzero(np.abs(data) > 1.0))
+            self.arb_info.configure(
+                text=f"{note} - peak {peak:g}, {over:,} sample(s) would be "
+                     f"CLIPPED at full scale", foreground="#c60")
+        else:
+            self.arb_info.configure(text=note, foreground="#000")
 
     def do_clear_pending(self):
         """Drop the waveform waiting to be uploaded.
@@ -3935,7 +4156,7 @@ class App:
         self.arb_source = ""
         self.arb_col_box.configure(values=(), state="disabled")
         self.arb_col.set("")
-        self.arb_info.configure(text="no file loaded", foreground="#666")
+        self.show_arb_info()
         self.log(f"Pending waveform cleared ({was}). Nothing was sent.")
         self.set_busy(self.busy)
         self.draw_preview()
@@ -3945,6 +4166,53 @@ class App:
             return
         ch = int(self.arb_ch.get())
         name = safe_name(self.arb_name.get())
+        if not name:
+            self.log("Give the waveform a name before uploading.")
+            messagebox.showerror("No name", "The waveform needs a name.")
+            return
+        # A last line of defence behind the capped entry box, for a name that
+        # reached the box some other way. Not a warning that can be waved
+        # through: this is the one thing this app can send that takes the
+        # generator down rather than merely getting it wrong.
+        if len(name) > MAX_ARB_NAME:
+            short = name[:MAX_ARB_NAME]
+            if not messagebox.askokcancel(
+                    "Name too long",
+                    f"'{name}' is {len(name)} characters. Names longer than "
+                    f"{MAX_ARB_NAME} have locked this generator's front panel "
+                    f"solid on upload, needing a power cycle.\n\n"
+                    f"Upload it as '{short}' instead?"):
+                return
+            name = short
+            self.arb_name.set(name)
+        samples = np.asarray(self.arb_samples, dtype=np.float64).ravel()
+        norm = self.norm.get()
+        # Clipping used to happen silently, inside dac_samples, and the local
+        # copy written afterwards held the clipped numbers - so a record that
+        # peaked at 1.14 came out flat-topped and was then flat-topped in the
+        # file as well, with nothing anywhere saying so.
+        peak = float(np.max(np.abs(samples)))
+        if not norm and peak > 1.0:
+            over = int(np.count_nonzero(np.abs(samples) > 1.0))
+            answer = messagebox.askyesnocancel(
+                "Samples past full scale",
+                f"{over:,} of {samples.size:,} samples are outside -1..+1 "
+                f"(peak {peak:g}), and 'normalise to full scale' is off.\n\n"
+                f"The DAC has no headroom above full scale, so every one of "
+                f"them would come out at the same flat top. Set the height "
+                f"with Ampl (Vpp) on the channel instead.\n\n"
+                f"Yes - divide by {peak:g} so the whole shape fits\n"
+                f"No - upload it flat-topped anyway\n"
+                f"Cancel - go back")
+            if answer is None:
+                return
+            if answer:
+                norm = True
+                self.log(f"Normalising on upload: peak was {peak:g}, so "
+                         f"{over:,} sample(s) would have been clipped.")
+            else:
+                self.log(f"WARNING: uploading '{name}' with {over:,} "
+                         f"sample(s) clipped flat at full scale.")
         if self.out_state.get(ch) == "ON" and self.confirm_output.get():
             if not messagebox.askokcancel(
                     "Upload to a live output?",
@@ -3953,7 +4221,6 @@ class App:
                     "Continue?"):
                 return
         self.set_busy(True)
-        samples, norm = self.arb_samples, self.norm.get()
 
         def work():
             try:
@@ -4036,6 +4303,10 @@ class App:
                                       f"Apply {os.path.basename(path)} to the "
                                       f"generator?{note}"):
             return
+        # Recalling is the last thing this window is for, and what it does next
+        # is all reported to the log and the panel behind it. Leaving it up
+        # only put a dialog over the picture of what had just been recalled.
+        self._setups_close()
         self.set_busy(True)
 
         def work():
@@ -4434,6 +4705,11 @@ class App:
                          ("arb_name", self.arb_name), ("arb_ch", self.arb_ch)):
             value = cfg.get(key)
             if isinstance(value, str) and value.strip():
+                # The entry box only validates keystrokes, and a config written
+                # before the length limit existed can hold a name long enough
+                # to wedge the generator.
+                if key == "arb_name":
+                    value = value[:MAX_ARB_NAME]
                 var.set(value)
         for key, var in (("normalise", self.norm),
                          ("confirm_output", self.confirm_output)):

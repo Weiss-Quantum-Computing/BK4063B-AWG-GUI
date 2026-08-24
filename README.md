@@ -38,17 +38,27 @@ This is the one place where a generator panel differs from a capture tool: a wro
 click here puts a voltage into something.
 
 - **Apply changes**, **Recall setup** and closing the window never touch an output
-  switch. Only the **ON** / **OFF** buttons do - per channel in its own row, or
-  **Both ON** / **Both OFF** beside **Connect** for an experiment that wants the
-  two switched as one. The pair asks once rather than twice, and quotes both
+  switch. Only the output buttons do - one per channel in its own row, plus a
+  **Both** button beside **Connect** for an experiment that wants the two
+  switched as one. The Both button asks once rather than twice, and quotes both
   channels.
 - **confirm before switching an output on** (on by default) puts a confirmation in
   front of anything that changes what a live channel is emitting: switching an
   output on, applying to a channel that is already on, or uploading an arb to one.
   The dialog quotes the generator's own last-read setting, not whatever unapplied
   edit is sitting in the panel.
-- The lamp beside each channel reads **ON** in red or **OFF** in green, taken from
-  the generator on every read - not from what the panel last asked for.
+- **Each output button is its own lamp.** It shows the state the generator last
+  reported - red **ON**, green **OFF**, grey **?** before the first read - and
+  clicking it asks for the other one. The **Both** button shows amber
+  **MIXED** when the two channels disagree.
+  The state comes from the generator on every read, never from what the panel
+  last asked for.
+
+  A single button that shows its state is safe here only because of the
+  asymmetry above: switching *on* is confirmed first, so a mis-click can only
+  ever switch an output off. **Both** follows the same rule and is not a plain
+  inversion - it switches both *on* only from both off, and from **MIXED**, or
+  from a state not yet read, it switches both off.
 
 Closing the app leaves a running channel running. That is deliberate: shutting a
 control panel should not interrupt something the bench is in the middle of.
@@ -56,12 +66,19 @@ control panel should not interrupt something the bench is in the middle of.
 ## The panel
 
 Each channel gets output state, load and polarity; a wave type with its
-parameters; arb selection and sample clock; and one modulation/sweep/burst row.
+parameters and the sample clock; the arb selection on a row of its own; and one
+modulation/sweep/burst row.
+
+**Clock** and **Sa/s** sit on the wave-type row, in the columns the parameters
+underneath them line up in - **Sa/s** over Offset, Low, Symmetry, Fall and Mean,
+**Clock** over the column beside it. They are settings like the rest and now
+read as ones, they fill a row that was three-quarters empty, and moving them up
+leaves the row below entirely to the waveform name.
 
 - **Greyed cells** are the parameters the current settings give no meaning to,
   and Apply ignores them even if they still hold a number from a previous type.
-  This works at two levels: the arb row only applies to `ARB`, and within it
-  **Sa/s** only applies to the **TrueArb** clock, since DDS derives
+  This works at two levels: the arb name and the clock only apply to `ARB`, and
+  within those **Sa/s** only applies to the **TrueArb** clock, since DDS derives
   its timing from the frequency instead. A greyed cell still shows what the
   generator reports - it just cannot be edited or sent.
 - **`*` markers** flag a cell you have edited but not applied yet, and the status
@@ -111,6 +128,13 @@ parameters; arb selection and sample clock; and one modulation/sweep/burst row.
   carrying them - after asking. A read used to keep them, which left the panel
   showing a mixture of what the instrument holds and what it does not, with
   only the asterisks to tell the two apart.
+- **A setting the channel cannot do is reported once**, on the way into it -
+  PWM on a carrier that is not a pulse, or sweep or burst under the TrueArb
+  clock. Once, and after the box it complains about has been repainted: the
+  dialog used to go up from inside the variable trace, so the rest of the
+  combobox's own selection landed while it was open and raised a second
+  identical dialog behind the first, with `TARB` only appearing in the box
+  after both had been dismissed.
 - **A mode that does not come on is reported.** After Apply enables a
   modulation, sweep or burst, the state is read back; if it did not take, the
   log and a dialog say so, and name the sample clock where that is the reason.
@@ -388,6 +412,19 @@ as numbers it is read as column names instead. All of these work:
 | Full scope capture | `time_s,CH1_V,CH2_V,...` |
 | `.npy` | `np.save("w.npy", samples)` |
 
+Blank lines and `#` comments are skipped, and so are **trailing empty fields** -
+a spreadsheet asked to save a one-column sheet writes `0,,,`, and those empty
+cells are columns it was never given rather than data. An empty field *between*
+two real ones is a hole in the data and is refused rather than silently shifting
+every column after it.
+
+**Load file...** opens on `Waveforms/` and then on wherever you were last, so
+the local copies are one click away. Point it at something that is not sample
+data and it now names the line it choked on: it used to guess that any parse
+failure meant a header row, re-read the file skipping one line, and report a
+numpy complaint about whatever word happened to sit at row 0, column 1 - which
+for a saved setup's `.txt` summary was the word `instrument`.
+
 With more than one column the **Column** dropdown next to the file name chooses
 which one holds the samples, listing the header names when the file has them. The
 default skips an obvious x-axis (`time`, `time_s`, `t`, `index`, ...) and takes
@@ -412,8 +449,17 @@ holds them, so a waveform does not change height the moment it is uploaded.
 so the biggest excursion reaches the DAC's full scale. Asymmetry is kept: a
 capture sitting entirely above zero still comes out entirely above the offset,
 using half the range. Turn normalising off if your samples are already in
--1.0..+1.0 and you want that headroom preserved exactly; anything beyond that
-range is clipped.
+-1.0..+1.0 and you want that headroom preserved exactly.
+
+**With normalising off, anything past ±1 is clipped, and the app now says so
+before it happens.** The DAC has no headroom above full scale, so a record
+scaled to peak at 1.14 does not come out 14% taller - the top 12% of it comes
+out as one flat line. The file-name line turns orange and counts the samples
+that would be flattened, and **Upload** stops to offer normalising instead.
+This used to happen in silence, and the local copy written afterwards held the
+clipped numbers, so the flat top was baked into the record on disk as well with
+nothing anywhere saying why. To make a waveform bigger, raise **Ampl (Vpp)** on
+the channel; scaling the samples past full scale cannot do it.
 
 Samples go out as signed 16-bit little-endian, matching the 4063B's 16-bit DAC.
 Any point count from 2 upwards is fine, odd included - 3, 7 and 101 points
@@ -423,6 +469,19 @@ generator would not take one. It does; the assumption was never tested and
 was simply wrong.
 There is no small size limit to design around - a 1,000,000-point record uploads
 in one go.
+
+**Keep the name to 11 characters.** The box will not take more. The generator
+stores an upload as `<name>.bin`, and that stored name is the thing with the
+limit: **15 characters is accepted, 16 is not**, measured at the front panel. So
+what you type gets 15 less the four it appends, and 11 is the last length that
+works.
+
+This is the one thing in this app that can take the generator down rather than
+merely get it wrong. Past the limit nothing is refused: the upload lands, the
+waveform is selected, the right shape comes out of the channel, and then the
+front panel locks solid - no buttons, no USB, a power cycle to recover. A 28-
+and a 29-character name each did exactly that, while every short name used on
+the same bench was fine. Hence a cap in the box rather than a warning.
 
 ### A worked example
 
@@ -683,6 +742,13 @@ The list under **Upload arbitrary waveform** shows what the generator holds, and
 whether this app has a local copy of the samples - beside the upload that fills
 it, which is both where it belongs and where there is room for it.
 
+**Refresh** re-reads both halves of the list: the generator's user memory, and
+the `Waveforms/` folder. The folder half needs nothing attached, so it works
+with the generator unplugged. Local copies used to be read only at startup,
+which meant a waveform dropped into `Waveforms/` - written there by a script, or
+pulled in with the project - stayed invisible until the app was restarted, with
+the list going on saying `no local copy` about a file sitting right there.
+
 **There is no remote delete.** Confirmed by probing rather than assumed: `WVDT
 DEL`, `STL DEL`, `DELETE` and the whole SCPI `MMEM` subsystem all return
 `-113 "Undefined header"`, and `C1:WVDT DEL,<name>` is accepted with no error and
@@ -695,7 +761,10 @@ copy into the pending slot, where the preview draws it and
 [Type/paste values...](#typing-or-pasting-values) shows its numbers — so you can
 see what a stored waveform is before doing anything with it, and edit it if you
 want. It sends nothing. To put an already-stored waveform onto a channel, use
-the **Arb wave** dropdown in that channel's row.
+the **Arb wave** dropdown in that channel's row, which is a row of its own the
+full width of the panel: a ttk drop-down list is only as wide as the box it
+hangs off, and at the old width a name was cut off in the very list it has to be
+recognised in.
 
 ### Why a local copy is needed at all
 
@@ -878,7 +947,8 @@ go off to the instrument on a thread, and a grab would freeze the panel that
 reports what they did.
 
 **Save setup** writes both channels' full state. **Recall setup** applies one back,
-in the order above, leaving the output switches alone. Recall is byte-exact: every
+in the order above, leaving the output switches alone, and closes the window -
+what it does next is all reported to the log and the panel behind it. Recall is byte-exact: every
 block reads back identical to what was saved, across sine, ramp, modulation, sweep,
 burst and TrueArb.
 
