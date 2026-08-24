@@ -905,7 +905,13 @@ def parse_pasted(text):
 # Column headings that are an x-axis rather than samples, so a file written as
 # time,volts picks the volts by default.
 TIME_NAMES = {"time", "time_s", "times", "t", "t_s", "sec", "secs", "seconds",
-              "s", "x", "index", "n", "sample", "samples"}
+              "s", "x", "index", "n", "sample", "samples",
+              # Scaled time axes. Without these a file headed `time_us,voltage_V`
+              # picks column 0 and uploads the TIME AXIS as the waveform - which
+              # normalises to a clean ramp, so it looks like a plausible arb
+              # rather than like a mistake.
+              "time_us", "time_ms", "time_ns", "t_us", "t_ms", "t_ns",
+              "us", "ms", "ns", "usec", "msec"}
 
 
 def read_table(path):
