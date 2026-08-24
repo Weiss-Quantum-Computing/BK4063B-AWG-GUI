@@ -493,7 +493,7 @@ It used to ship with a script that generated it, because there was no other way
 to ask for such a thing. The panel now builds it directly: **Blackman-Harris**,
 **Using real units with 5e6 Sa/s**, length `10m`, carrier `100e3`.
 
-![Blackman-windowed 100 kHz burst](Waveforms/blackman_100kHz_10ms.png)
+![Blackman-windowed 100 kHz burst](figures/blackman_100kHz_10ms.png)
 
 The sample rate baked into the file (5 MSa/s) is a resolution choice, nothing
 more - the file carries no timing. Setting Clock = TrueArb, Sa/s = 5e6 makes the
@@ -615,7 +615,7 @@ Everything on the channel panel reaches the trace:
 | Burst | period, cycle count, delay, start phase (N-cycle), **including the level it rests at between bursts** |
 | Arb | the local copy, held or interpolated per the clock |
 
-![Parameters the preview now honours](Waveforms/preview_modes.png)
+![Parameters the preview now honours](figures/preview_modes.png)
 
 **With a mode running, the window follows the envelope rather than the carrier** -
 the modulating period for AM/FM/PM/PWM, the keying period for the shift keys, the
@@ -688,7 +688,7 @@ With both channels on one scale, a small signal beside a large one is a flat
 line. Ticking **separate Y axes** gives CH1 the left axis and CH2 the right, each
 scaled to its own trace and coloured to match:
 
-![Shared scaling flattens CH1; separate axes make both readable](Waveforms/split_y_axes.png)
+![Shared scaling flattens CH1; separate axes make both readable](figures/split_y_axes.png)
 
 Same two signals both times - 0.6 Vpp on CH1 against 8 Vpp on CH2. The pending
 trace follows whichever axis its target channel is on. The option is ignored when
@@ -717,7 +717,7 @@ appeared because the *other* channel was slow will clear.
 The same stored points come out as two different shapes depending on the clock,
 confirmed on a scope:
 
-![TrueArb holds each sample; DDS ramps between them](Waveforms/dds_vs_truearb.png)
+![TrueArb holds each sample; DDS ramps between them](figures/dds_vs_truearb.png)
 
 - **TrueArb** clocks each point out and holds it until the next, so the output is
   a staircase and every value you wrote is a real flat level.
@@ -801,9 +801,12 @@ the generator makes that waveform previewable without re-uploading it. Waveforms
 that predate this app show as `no local copy` until you do one or the other.
 
 `.npy` copies from before this change are still read, and are rewritten as CSV
-at startup with the original left in place — the log says which. Only `.csv` and
-`.png` in `Waveforms/` are tracked by git; uploaded copies are bench artefacts
-and stay out, the same way captured data does.
+at startup with the original left in place — the log says which. Only `.csv` in
+`Waveforms/` is tracked by git; uploaded copies are bench artefacts and stay
+out, the same way captured data does. The figures in this README live in
+`figures/`, apart from the sample data - `Waveforms/` is what **Load file...**
+opens on, and a folder of screenshots is not what you want to be looking at
+there.
 
 **Deleting** an uploaded waveform has to be done at the front panel
 (Utility -> Store/Recall) - the firmware exposes no SCPI for it.
