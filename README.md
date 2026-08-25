@@ -2,8 +2,8 @@
 
 Panel control for a B&K Precision 4063B arbitrary waveform generator. The mirror
 image of [Scope Grab](../scope-grab): instead of pulling a capture off an
-instrument, this pushes a setup onto one. Same shape - single file, PyVISA over
-the rear-panel USB-B port, no vendor software.
+instrument, this pushes a setup onto one. Same shape - PyVISA over the
+rear-panel USB-B port, no vendor software.
 
 Edit the panel, press **Apply changes**, and the generator follows. Press
 **Save setup** and the whole instrument state lands in a timestamped JSON you can
@@ -20,6 +20,8 @@ recall later or file alongside the data it produced.
   up either way)
 - Python 3.9+
 - `pip install pyvisa numpy matplotlib`
+- `bk4063b.py` next to `bk4063b_awg_gui.py` - the panel imports the instrument
+  layer from it rather than carrying a second copy
 
 Matplotlib is optional; without it you lose the waveform preview and nothing else.
 
@@ -814,8 +816,9 @@ there.
 ## Command ordering
 
 The 4063B accepts these without error and then silently ignores or overrides
-them. `Awg.apply_channel` sequences around all four; they are worth knowing if you
-drive the instrument from your own scripts.
+them. `BK4063B.apply_channel` sequences around all four, so a script that calls it
+gets the same ordering the panel does - the rest are worth knowing if you write the
+SCPI yourself.
 
 - **The declared load rescales amplitude.** Set the load *after* the amplitude and
   a 1.5 Vpp request typed against HiZ quietly becomes 0.75 Vpp when the load
@@ -961,11 +964,10 @@ clobber it.
 
 ## Scripting
 
-[`bk4063b.py`](bk4063b.py) is a standalone scripting library for the same
-instrument. The GUI does not import it - `bk4063b_awg_gui.py` carries its own
-copy of the instrument layer so it stays a single droppable file - but the
-library adds per-waveform convenience methods the GUI's internal `Awg` class
-does not have, plus a scoped `snapshot`/`restore` pair.
+[`bk4063b.py`](bk4063b.py) is the project's instrument layer, and it is also
+the scripting library. The panel imports it, so there is one copy of the SCPI
+ordering, the reply parser and the arb upload path: a fix to any of them lands in
+`Apply changes` and in your scripts at the same time.
 
 ```python
 from bk4063b import BK4063B
@@ -976,3 +978,12 @@ with BK4063B() as awg:
     awg.output(2, True, load=50)
     awg.restore(snap)
 ```
+
+`snapshot()` writes the same shape the panel saves into `awg_setups/*.json`, so a
+setup saved from either one recalls in the other.
+
+On top of what the panel uses, the library adds per-waveform helpers - `sine`,
+`square`, `ramp`, `pulse`, `noise`, `dc`, `arb` - and the scoped
+`snapshot`/`restore` pair above. `BK4063B()` connects on construction; the panel
+builds it with `BK4063B(connect=False)` and calls `connect()` from its worker
+thread instead.

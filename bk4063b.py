@@ -13,19 +13,55 @@ responses use comma-separated KEY,VALUE lists.
         awg.sine(1, freq=1e3, amp=2.0, offset=0.0)
         awg.output(1, True, load=50)
 
+This is the project's only instrument layer: bk4063b_awg_gui.py imports it
+rather than carrying its own copy, so a fix to the SCPI ordering, the reply
+parser or the arb upload path lands in the panel and in scripts at once.
+
 Requires: pyvisa + a VISA runtime (NI-VISA is installed on this machine).
+          numpy is optional - it only speeds up dac_samples().
 """
 
 from __future__ import annotations
 
+import datetime
 import struct
 
 import pyvisa
 
-__all__ = ["BK4063B", "InstrumentError"]
+try:                       # only the sample-prep fast path needs it
+    import numpy as np
+except ImportError:
+    np = None
+
+__all__ = ["BK4063B", "InstrumentError", "parse_reply", "dac_samples",
+           "USB_ID", "CHANNELS", "CARR_KEYS", "TARB_BLOCKS", "MODE_VERB",
+           "MODE_VERBS"]
 
 # USB vendor/product for the B&K 4060B series.
-_USB_ID = "0xF4EC::0xEE38"
+USB_ID = "0xF4EC::0xEE38"
+
+CHANNELS = (1, 2)
+
+# Carrier settings a mode block will accept as CARR,<key>,<value>, so they can
+# be changed without a BSWV write - which switches modulation, sweep and burst
+# straight off. Measured on the instrument, because the difference is silent:
+# AMP, FRQ, OFST, PHSE and DUTY all take and leave a burst running, while
+# CARR,PERI, CARR,HLEV and CARR,LLEV are accepted and quietly ignored. The rest
+# are from the programming guide's own CARR table.
+CARR_KEYS = {"WVTP", "FRQ", "PHSE", "AMP", "OFST", "SYM", "DUTY",
+             "RISE", "FALL", "DLY", "STDEV", "MEAN"}
+
+# Sweep and burst are not available while a channel's sample clock is TrueArb.
+# Measured, not inferred: BTWV STATE,ON and SWWV STATE,ON both read back OFF
+# under TARB and ON under DDS, reproducibly, while MDWV is unaffected. The
+# generator does not refuse the command - it accepts it and stays off, which is
+# why a burst set up from the panel looked like it was losing its settings.
+TARB_BLOCKS = ("Sweep", "Burst")
+
+# Which SCPI block each mode lives in. All three are cleared before one is
+# enabled, because the instrument allows only one at a time.
+MODE_VERB = {"Sweep": "SWWV", "Burst": "BTWV"}
+MODE_VERBS = ("MDWV", "SWWV", "BTWV")
 
 
 class InstrumentError(RuntimeError):
@@ -55,11 +91,41 @@ def _strip_unit(text: str):
         return text
 
 
+def dac_samples(samples, normalize=True):
+    """The samples exactly as the DAC will receive them, in -1..+1.
+
+    One definition on purpose. This used to be written out separately where the
+    bytes were packed, where the local copy was kept, and not at all where the
+    pending trace was drawn - so the preview showed raw file values while
+    everything after the upload showed normalised ones, and the same waveform
+    changed height the moment it was sent.
+
+    Returns a numpy array when numpy is installed (which is what the panel
+    plots), a list otherwise.
+    """
+    if np is not None:
+        data = np.asarray(samples, dtype=np.float64).ravel()
+        if normalize:
+            peak = float(np.max(np.abs(data))) if data.size else 0.0
+            if peak == 0:
+                raise ValueError("all samples are zero; nothing to normalise")
+            data = data / peak
+        return np.clip(data, -1.0, 1.0)
+
+    data = [float(s) for s in samples]
+    if normalize:
+        peak = max((abs(s) for s in data), default=0.0)
+        if peak == 0:
+            raise ValueError("all samples are zero; nothing to normalise")
+        data = [s / peak for s in data]
+    return [max(-1.0, min(1.0, s)) for s in data]
+
+
 # Modulation types appear as a bare tag with no value, mid-response.
 _BARE_TAGS = {"AM", "DSBAM", "FM", "PM", "PWM", "ASK", "FSK", "PSK"}
 
 
-def _parse(response: str) -> dict:
+def parse_reply(response: str) -> dict:
     """Turn 'C1:BSWV WVTP,SINE,FRQ,1000HZ' into {'WVTP': 'SINE', 'FRQ': 1000.0}.
 
     Three wrinkles in this dialect stop a plain pairwise split from working:
@@ -83,7 +149,7 @@ def _parse(response: str) -> dict:
     while i < len(fields):
         key = fields[i]
         if key == "CARR":
-            out["CARR"] = _parse("CARR " + ",".join(fields[i + 1:]))
+            out["CARR"] = parse_reply("CARR " + ",".join(fields[i + 1:]))
             break
         if key in _BARE_TAGS:
             out["TYPE"] = key
@@ -101,41 +167,98 @@ def _parse(response: str) -> dict:
 class BK4063B:
     """A connected 4063B. Use as a context manager, or call close() yourself."""
 
-    def __init__(self, resource: str | None = None, timeout: int = 5000,
-                 resource_manager: pyvisa.ResourceManager | None = None):
-        self._rm = resource_manager or pyvisa.ResourceManager()
-        self._owns_rm = resource_manager is None
-        self.resource_name = resource or self.find(self._rm)
-        self.dev = self._rm.open_resource(self.resource_name)
-        self.dev.timeout = timeout
-        self.dev.read_termination = "\n"
-        self.dev.write_termination = "\n"
-        self.idn = self.query("*IDN?")
-        if "4063B" not in self.idn:
-            raise InstrumentError(f"{self.resource_name} is not a 4063B: {self.idn}")
+    def __init__(self, resource: str | None = None, timeout: int = 20000,
+                 resource_manager: pyvisa.ResourceManager | None = None,
+                 connect: bool = True):
+        """connect=False builds the object without touching the bus, for a caller
+        that opens the instrument later from a worker thread."""
+        self._given_rm = resource_manager       # if supplied, never closed by us
+        self._rm = None
+        self._timeout = timeout
+        self.dev = None
+        self.resource_name = ""
+        self.idn = ""
+        if connect:
+            self.connect(resource)
 
     # ---------------------------------------------------------------- plumbing
+
+    @property
+    def connected(self) -> bool:
+        return self.dev is not None
 
     @staticmethod
     def find(rm: pyvisa.ResourceManager | None = None) -> str:
         """Return the VISA resource string for the first 4060B-series unit."""
         rm = rm or pyvisa.ResourceManager()
         for name in rm.list_resources():
-            if _USB_ID in name:
+            if USB_ID in name:
                 return name
         raise InstrumentError(
             "No B&K 4060B-series generator found. Resources seen: "
             + ", ".join(rm.list_resources())
         )
 
+    def connect(self, resource: str | None = None) -> str:
+        """Open the generator, check it answers as a 4063B, return its *IDN?.
+
+        With no resource string: the generator's own VID/PID first, then anything
+        else on USB, so an unexpected address still connects if what is behind it
+        identifies correctly.
+        """
+        self.close()
+        self._rm = self._given_rm or pyvisa.ResourceManager()
+        if resource:
+            candidates = [resource]
+        else:
+            seen = list(self._rm.list_resources())
+            candidates = [r for r in seen if USB_ID in r]
+            candidates += [r for r in seen
+                           if r.startswith("USB") and r not in candidates]
+
+        wrong = None
+        for res in candidates:
+            try:
+                dev = self._rm.open_resource(res)
+                dev.timeout = 5000                  # short while probing
+                dev.read_termination = "\n"
+                dev.write_termination = "\n"
+                idn = dev.query("*IDN?").strip()
+            except Exception:
+                continue
+            if "4063B" in idn:
+                # Roomy once it is the right instrument: an arb upload is one
+                # multi-megabyte transfer and the probe timeout will not carry it.
+                dev.timeout = self._timeout
+                dev.chunk_size = 1024 * 1024
+                self.dev, self.idn, self.resource_name = dev, idn, res
+                return idn
+            wrong = wrong or (res, idn)
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+        self.close()
+        if resource and wrong:
+            raise InstrumentError(f"{wrong[0]} is not a 4063B: {wrong[1]}")
+        raise InstrumentError(
+            "No B&K 4063B found on USB. Check the rear-panel USB-B cable and that "
+            "NI MAX still sees the generator. Resources seen: "
+            + (", ".join(candidates) if candidates else "none"))
+
     def write(self, command: str) -> None:
+        if self.dev is None:
+            raise InstrumentError("not connected; call connect() first")
         self.dev.write(command)
 
     def query(self, command: str) -> str:
+        if self.dev is None:
+            raise InstrumentError("not connected; call connect() first")
         return self.dev.query(command).strip()
 
     def query_dict(self, command: str) -> dict:
-        return _parse(self.query(command))
+        return parse_reply(self.query(command))
 
     def wait(self) -> None:
         """Block until the instrument finishes the preceding commands."""
@@ -147,11 +270,16 @@ class BK4063B:
         self.wait()
 
     def close(self) -> None:
-        try:
-            self.dev.close()
-        finally:
-            if self._owns_rm:
-                self._rm.close()
+        """Idempotent, and never raises: callers close on the way out of a failed
+        connect as well as a good one."""
+        dev, rm = self.dev, self._rm
+        self.dev = self._rm = None
+        for obj in (dev, rm if self._given_rm is None else None):
+            try:
+                if obj is not None:
+                    obj.close()
+            except Exception:
+                pass
 
     def __enter__(self):
         return self
@@ -198,6 +326,10 @@ class BK4063B:
 
     def is_on(self, channel: int) -> bool:
         return self.get_output(channel).get("STATE") == "ON"
+
+    def set_output(self, channel: int, on: bool) -> None:
+        """Just the switch, with no readback - what the panel's ON/OFF buttons send."""
+        self.write(f"{self._ch(channel)}:OUTP {'ON' if on else 'OFF'}")
 
     # -------------------------------------------------------------- basic wave
 
@@ -280,7 +412,7 @@ class BK4063B:
         return self.query_dict(f"{self._ch(channel)}:SRATE?")
 
     def upload_arb(self, channel: int, name: str, samples, freq=None, amp=None,
-                   offset=None, phase=None, normalize: bool = True) -> None:
+                   offset=None, phase=None, normalize: bool = True) -> int:
         """Upload a waveform to the generator user memory and select it.
 
         samples: an iterable of floats. With normalize=True they are scaled so
@@ -292,21 +424,22 @@ class BK4063B:
         4063B expects. Any count from 2 upwards works, odd included - measured,
         not assumed: 3, 7 and 101 points all store and read back at exactly
         their length.
+
+        Returns the number of points stored.
         """
-        data = [float(s) for s in samples]
+        if self.dev is None:
+            raise InstrumentError("not connected; call connect() first")
+        data = (np.asarray(samples, dtype=np.float64).ravel() if np is not None
+                else [float(s) for s in samples])
         if len(data) < 2:
             raise ValueError("need at least 2 samples")
+        data = dac_samples(data, normalize=normalize)
 
-        if normalize:
-            peak = max(abs(min(data)), abs(max(data)))
-            if peak == 0:
-                raise ValueError("all samples are zero; nothing to normalize")
-            data = [s / peak for s in data]
-
-        codes = bytearray()
-        for s in data:
-            code = int(round(max(-1.0, min(1.0, s)) * 32767))
-            codes += struct.pack("<h", code)
+        if np is not None:
+            codes = np.round(data * 32767).astype("<i2").tobytes()
+        else:
+            codes = b"".join(struct.pack("<h", int(round(v * 32767)))
+                             for v in data)
 
         header = f"{self._ch(channel)}:WVDT WVNM,{name}"
         for key, value in (("FREQ", freq), ("AMPL", amp),
@@ -317,9 +450,10 @@ class BK4063B:
 
         # One write_raw so the USBTMC END bit lands after the last data byte;
         # a trailing terminator here would be swallowed as waveform data.
-        self.dev.write_raw(header.encode("ascii") + bytes(codes))
+        self.dev.write_raw(header.encode("ascii") + codes)
         self.wait()
         self.write(f"{self._ch(channel)}:ARWV NAME,{name}")
+        return len(data)
 
     # -------------------------------------------------------------- modulation
 
@@ -419,28 +553,144 @@ class BK4063B:
             self.write(f"ROSC {source}")
         return self.query_dict("ROSC?")
 
+    # --------------------------------------------------------- whole-channel
+    def read_channel(self, channel: int) -> dict:
+        """Every block the panel shows, as the instrument's own raw strings."""
+        prefix = self._ch(channel)
+        return {verb: self.query(f"{prefix}:{verb}?")
+                for verb in ("OUTP", "BSWV", "ARWV", "SRATE",
+                             "MDWV", "SWWV", "BTWV")}
+
+
+    def apply_channel(self, ch: int, blocks: dict, log=lambda s: None) -> list:
+        """Push one channel's settings, in the only order the 4063B accepts.
+
+        `blocks` is {verb: {key: value}} holding just what should be written.
+        The ordering is not cosmetic - the instrument silently overrides
+        earlier writes with later ones:
+
+          The declared load rescales amplitude, so it must precede BSWV -- set
+            it after and a 1.5 Vpp request typed against HiZ silently becomes
+            0.75 Vpp when the load is then changed to 50 ohm.
+          ARWV and SRATE both force WVTP,ARB, so both must precede BSWV.
+          BSWV clears any active modulation, so it must precede the mode block.
+
+        Get this wrong and the commands are all accepted, with the caller and the
+        generator quietly disagreeing about what is being output.
+
+        Returns what did not take, which is nothing on a good day.
+        """
+        prefix = self._ch(ch)
+        missed = []
+
+        def send(command):
+            self.write(command)
+            log(f"  {command}")
+
+        outp = blocks.get("OUTP") or {}
+        parts = [f"{k},{v}" for k, v in outp.items() if k != "STATE" and v != ""]
+        if parts:
+            send(f"{prefix}:OUTP {','.join(parts)}")
+
+        arb = blocks.get("ARWV") or {}
+        if arb.get("NAME"):
+            send(f"{prefix}:ARWV NAME,{arb['NAME']}")
+        elif arb.get("INDEX") not in (None, ""):
+            send(f"{prefix}:ARWV INDEX,{int(float(arb['INDEX']))}")
+
+        srate = blocks.get("SRATE") or {}
+        if srate:
+            args = ",".join(f"{k},{v}" for k, v in srate.items() if v != "")
+            if args:
+                send(f"{prefix}:SRATE {args}")
+
+        bswv = blocks.get("BSWV") or {}
+        carrier_type = bswv.get("WVTP")
+        # BSWV switches modulation, sweep and burst off - which is why setting
+        # an amplitude used to take a burst with it. The mode blocks carry the
+        # carrier's own settings for exactly this reason, so when everything
+        # being changed can go that way, it does, and the mode never stops.
+        # Anything CARR will not take still needs BSWV, and the mode block
+        # below then puts the mode back.
+        carried = {}
+        active = blocks.get("MODE") and blocks["MODE"][0] != "Off"
+        if bswv and active and set(bswv) <= CARR_KEYS:
+            carried, bswv = bswv, {}
+        if bswv:
+            args = ",".join(f"{k},{v}" for k, v in bswv.items() if v != "")
+            if args:
+                send(f"{prefix}:BSWV {args}")
+
+        if carrier_type == "ARB" and srate.get("MODE") == "TARB":
+            # TrueArb quantises its clock against the loaded waveform, so the
+            # pre-BSWV write lands a few ppm off. Re-asserting it afterwards is
+            # only safe here because SRATE forces WVTP,ARB - which is what this
+            # channel is already set to.
+            args = ",".join(f"{k},{v}" for k, v in srate.items() if v != "")
+            self.write(f"{prefix}:SRATE {args}")
+
+        if "MODE" in blocks:
+            mode, params = blocks["MODE"]
+            for verb in MODE_VERBS:
+                self.write(f"{prefix}:{verb} STATE,OFF")
+            if mode != "Off":
+                verb = MODE_VERB.get(mode, "MDWV")
+                # STATE and the type tag have to be sent separately: combined,
+                # the instrument applies the state and drops the type switch.
+                # The manual is explicit that STATE must be ON before any other
+                # parameter of a burst is set, so this ordering is required
+                # rather than merely tidy.
+                send(f"{prefix}:{verb} STATE,ON")
+                args = ",".join(f"{k},{v}" for k, v in params.items() if v != "")
+                carr = ",".join(f"{k},{v}" for k, v in carried.items() if v != "")
+                if carr:
+                    args = f"{args},CARR,{carr}" if args else f"CARR,{carr}"
+                lead = f"{mode}," if verb == "MDWV" else ""
+                if lead or args:
+                    send(f"{prefix}:{verb} {lead}{args}")
+                # Read it back rather than trusting the write. There is no
+                # usable error channel on this generator: SYST:ERR? answers
+                # every query with the same complaint about the query itself,
+                # and *ESR? sets its command-error bit on every Cn: command
+                # whether it worked or not - a plain BSWV AMP,1 sets it. The
+                # state is the only thing that tells the truth.
+                missed += self.mode_took(ch, verb, mode)
+            else:
+                log(f"  {prefix}: modulation, sweep and burst all off")
+        return missed
+
+    def mode_took(self, ch: int, verb: str, mode: str) -> list:
+        """Empty if the mode really is on, or one line saying it is not."""
+        try:
+            state = parse_reply(self.query(f"{self._ch(ch)}:{verb}?")).get("STATE")
+            if state == "ON":
+                return []
+            clock = parse_reply(self.query(f"{self._ch(ch)}:SRATE?")).get("MODE")
+        except Exception:
+            return []                 # a check that cannot run is not a failure
+        why = (" - the sample clock is TrueArb, and this generator allows only "
+               "modulation there. Set Clock to DDS on this channel."
+               if clock == "TARB" and mode in TARB_BLOCKS else "")
+        return [f"CH{ch} {mode} did not switch on{why}"]
+
     # ------------------------------------------------------- state save/restore
 
-    def snapshot(self, channels=(1, 2)) -> dict:
+    def snapshot(self, channels=CHANNELS) -> dict:
         """Capture enough state to put the generator back the way you found it.
 
         Pass channels=(2,) to scope the snapshot -- restore() only rewrites what
         the snapshot holds, so scoping is how you guarantee a live channel is
         left alone.
+
+        This is the shape the panel writes into awg_setups/*.json, string channel
+        keys and all, so a setup saved by either one recalls in the other.
         """
-        state = {"idn": self.idn, "channels": {}}
-        for ch in channels:
-            prefix = self._ch(ch)
-            state["channels"][ch] = {
-                "OUTP": self.query(f"{prefix}:OUTP?"),
-                "BSWV": self.query(f"{prefix}:BSWV?"),
-                "ARWV": self.query(f"{prefix}:ARWV?"),
-                "SRATE": self.query(f"{prefix}:SRATE?"),
-                "MDWV": self.query(f"{prefix}:MDWV?"),
-                "SWWV": self.query(f"{prefix}:SWWV?"),
-                "BTWV": self.query(f"{prefix}:BTWV?"),
-            }
-        return state
+        return {
+            "captured": datetime.datetime.now().isoformat(timespec="seconds"),
+            "instrument": self.idn,
+            "address": self.resource_name,
+            "channels": {str(ch): self.read_channel(ch) for ch in channels},
+        }
 
     def restore(self, state: dict) -> None:
         """Replay a snapshot(). Outputs are switched last so nothing goes live
@@ -452,17 +702,17 @@ class BK4063B:
             # Order is load-bearing. Selecting an arb forces WVTP,ARB, so ARWV
             # has to precede BSWV; writing BSWV clears any active modulation, so
             # it in turn has to precede the mode blocks.
-            arb = _parse(groups["ARWV"])
+            arb = parse_reply(groups["ARWV"])
             if arb.get("INDEX") is not None:
                 # Built-in waveforms only reload by index; NAME silently no-ops.
                 self.write(f"{prefix}:ARWV INDEX,{int(arb['INDEX'])}")
             elif arb.get("NAME"):
                 self.write(f"{prefix}:ARWV NAME,{arb['NAME']}")
 
-            srate = _parse(groups["SRATE"])
+            srate = parse_reply(groups["SRATE"])
             self._set(ch, "SRATE", srate)
 
-            carrier = _parse(groups["BSWV"])
+            carrier = parse_reply(groups["BSWV"])
             for key in ("PERI", "MAX_OUTPUT_AMP", "HLEV", "LLEV", "AMPVRMS"):
                 carrier.pop(key, None)          # readback-only, rejected on write
             self._set(ch, "BSWV", carrier)
@@ -476,7 +726,7 @@ class BK4063B:
 
             # Modulation, sweep and burst are mutually exclusive; clear all three,
             # then re-enable whichever one was actually running.
-            modes = {v: _parse(groups[v]) for v in ("MDWV", "SWWV", "BTWV")}
+            modes = {v: parse_reply(groups[v]) for v in ("MDWV", "SWWV", "BTWV")}
             for verb in modes:
                 self.write(f"{prefix}:{verb} STATE,OFF")
             for verb, params in modes.items():
@@ -497,7 +747,7 @@ class BK4063B:
                 if args:
                     self.write(f"{prefix}:{verb} {lead}{args}")
 
-            self.write(f"{prefix}:OUTP {_parse(groups['OUTP']).get('STATE', 'OFF')}")
+            self.write(f"{prefix}:OUTP {parse_reply(groups['OUTP']).get('STATE', 'OFF')}")
 
 
 if __name__ == "__main__":
