@@ -744,6 +744,12 @@ def build_sequence(segments, rate, unit="us", baseline=0.0, coherent=False,
     hertz into cycles across the segment, so a sequence is only true at the
     rate it was built for.
 
+    A segment is a whole number of samples, so what the record holds is
+    round(time x rate) / rate and not the time that was typed. That rounded
+    length is what every carrier and every phase reference below is worked out
+    from, and it is what the returned rows report - the typed time is a
+    request, and this is the record.
+
     `coherent` references every carrier to the start of the sequence rather
     than to its own segment, which is what makes the second pulse of a Ramsey
     pair arrive with a defined phase relative to the first. Off, the typed
@@ -769,6 +775,17 @@ def build_sequence(segments, rate, unit="us", baseline=0.0, coherent=False,
             raise ValueError(
                 f"segment {index} ({shape}) comes to {n} point(s) at "
                 f"{rate:.10g} Sa/s - give it a longer time or a faster clock")
+        # The length the record actually has, which is not the length asked
+        # for. Carrying the typed time past this point did two things, both
+        # measured by fitting a sine back out of the built record. It put
+        # freq x span cycles into a segment only n samples long, so a segment
+        # asked for 5 MHz came out at 5.025 MHz. And it referenced a coherent
+        # phase to a moment that is not in the record. Together those left
+        # each boundary 4.5 degrees out at 5 MHz into 100 MSa/s - and it
+        # accumulates, reaching 171 degrees by the twentieth segment, which is
+        # a Ramsey pair arriving very nearly out of phase.
+        span_n = n / rate
+        gap_n = int(round(gap * rate))
         freq = _as_float(seg.get("freq"), 0.0)
         phase = _as_float(seg.get("phase"), 0.0)
         if coherent:
@@ -776,16 +793,15 @@ def build_sequence(segments, rate, unit="us", baseline=0.0, coherent=False,
             # been running since the sequence began.
             phase += 360.0 * freq * elapsed
         y = _segment_samples(shape, n, parse_kv(seg.get("extra")),
-                             freq * span, phase, waves)
+                             freq * span_n, phase, waves)
         pieces.append(np.asarray(y, dtype=np.float64) * _as_float(
             seg.get("ampl"), 1.0))
-        rows.append((index, shape, n, span, gap))
-        elapsed += span
+        rows.append((index, shape, n, span_n, gap_n / rate))
+        elapsed += span_n
 
-        gap_n = int(round(gap * rate))
         if gap_n > 0:
             pieces.append(np.full(gap_n, float(baseline)))
-        elapsed += gap
+        elapsed += gap_n / rate
 
     if not pieces:
         raise ValueError("no segments to build - add one first")
@@ -809,8 +825,15 @@ def sequence_extent(segments, rate, unit="us"):
                 seconds = parse_time(seg.get(key), unit, 0.0)
             except ValueError:
                 continue
-            span += seconds
-            points += int(round(seconds * rate)) if rate > 0 else 0
+            if rate > 0:
+                # The same rounding build_sequence does, so the running total
+                # under the list is the record's own length rather than the
+                # sum of what was asked for.
+                whole = int(round(seconds * rate))
+                span += whole / rate
+                points += whole
+            else:
+                span += seconds
     return count, span, points
 
 

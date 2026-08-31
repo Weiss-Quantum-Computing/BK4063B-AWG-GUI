@@ -332,6 +332,17 @@ comes out `n/(n-1)` high and it hands its neighbour a phase one sample out. The
 shape keeps the closed interval, because a ramp typed `0` to `1` should reach 1
 where a carrier's endpoints are merely where the window fell.
 
+A segment is also a **whole number of samples**, so the record holds
+`round(time x rate) / rate` rather than the time typed - and that rounded length
+is what the carrier and the phase reference are worked out from. The typed time
+is a request; the record is what the generator will actually clock out, and the
+two differ by up to half a sample per boundary. Reading the request instead put
+`freq x time` cycles into a segment only `n` samples long, so 5 MHz asked for
+over 1.005 us at 100 MSa/s came out at 5.025 MHz, and referenced a coherent
+phase to a moment not in the record: 4.5 degrees out per boundary, accumulating
+to 171 degrees by the twentieth segment. The running total under the segment
+list rounds the same way, so what it says is what Build will produce.
+
 ### The two shapes a sequence adds
 
 - **Hold (DC)** is a flat `level`, which is what a ramp needs to sit on. Ramp up,
