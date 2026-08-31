@@ -1157,8 +1157,16 @@ def _mod_wave(name, u):
     return np.sin(2.0 * np.pi * u)
 
 
-def _shape(wvtp, ph, num, period, arb, hold, duty_over=None):
-    """Unit shape, -1..1, from carrier phase ph (in cycles)."""
+def _shape(wvtp, ph, num, carrier_period, arb, hold, duty_over=None):
+    """Unit shape, -1..1, from carrier phase ph (in cycles).
+
+    `carrier_period` is how long one cycle of `ph` lasts, in seconds, and it is
+    nothing else. A pulse's width, edges and delay are set in real time, so
+    turning them into the fraction of a cycle this works in needs the period
+    that fraction is of. Handed the preview window instead - which under a mode
+    is the modulating envelope - a 200 us pulse on a 1 kHz carrier came out
+    drawn as a 20 us one for the whole of a 10 ms burst period.
+    """
     x = ph % 1.0
     if wvtp == "SINE":
         return np.sin(2.0 * np.pi * x)
@@ -1169,16 +1177,24 @@ def _shape(wvtp, ph, num, period, arb, hold, duty_over=None):
         sym = np.clip(num("SYM", 50.0) / 100.0, 1e-6, 1 - 1e-6)
         return np.where(x < sym, 2 * x / sym - 1, 1 - 2 * (x - sym) / (1 - sym))
     if wvtp == "PULSE":
-        # Delay slides the pulse inside its own period; rise and fall are real
-        # times, so they only mean anything as a fraction of that period.
-        x = (x - num("DLY") / period) % 1.0
+        # Delay slides the pulse inside its own cycle; rise and fall are real
+        # times, so they only mean anything as a fraction of that cycle.
+        x = (x - num("DLY") / carrier_period) % 1.0
         width = num("WIDTH")
-        duty = (width / period if width > 0
-                else (duty_over if duty_over is not None
-                      else num("DUTY", 20.0) / 100.0))
+        # duty_over first. It is PWM's modulated width, and the caller has
+        # already folded WIDTH into it - so preferring WIDTH here threw the
+        # modulation away and drew a plain pulse train, which made PWM the one
+        # mode whose whole subject is the width and the one mode that did not
+        # move.
+        if duty_over is not None:
+            duty = duty_over
+        elif width > 0:
+            duty = width / carrier_period
+        else:
+            duty = num("DUTY", 20.0) / 100.0
         duty = np.clip(duty, 1e-6, 1 - 1e-6)
-        rise = max(num("RISE") / period, 1e-9)
-        fall = max(num("FALL") / period, 1e-9)
+        rise = max(num("RISE") / carrier_period, 1e-9)
+        fall = max(num("FALL") / carrier_period, 1e-9)
         y = np.zeros_like(x)
         y = np.where(x < rise, x / rise, y)
         y = np.where((x >= rise) & (x < duty), 1.0, y)
@@ -1381,8 +1397,8 @@ def idle_volts(wvtp, vals, phase_deg, arb=None, hold=True, invert=False):
     """The volts the carrier sits at when it is parked at `phase_deg`.
 
     What a burst rests at between bursts. Evaluated at the phase itself rather
-    than read off the first sample of a drawn trace: that trace starts one
-    sample in, which put a sine that rests at 0 V at 8 mV.
+    than read off the first sample of a drawn trace, so it needs no window, no
+    point budget and no clock to be right.
     """
     num = _numget(vals)
     ofst = num("OFST")
@@ -1533,11 +1549,18 @@ def preview_curve(wvtp, vals, arb=None, periods=2.0, n=None, hold=True,
         return t, num("MEAN") + (-y if invert else y), note
 
     # One phase accumulator for the lot: a plain carrier is the constant case,
-    # and FM, FSK and a sweep are the same integral with f varying.
-    ph = np.cumsum(f_inst) * dt + ph_off
+    # and FM, FSK and a sweep are the same integral with f varying. Summed from
+    # zero rather than with a plain cumsum, which counts the first sample's own
+    # step and so starts the trace one sample in - a 0-phase 2 Vpp sine came
+    # out of that at 6 mV instead of at 0 V.
+    ph = np.concatenate(([0.0], np.cumsum(f_inst[:-1]))) * dt + ph_off
     if bursting is not None:
         ph = np.where(bursting, burst_phase, rest_phase)
-    y = _shape(wvtp, ph, num, period, arb, hold, duty_over=duty_over)
+    # 1/freq, not `period`: `period` sizes the window, and under a mode that
+    # is the modulating envelope. What a pulse's width and edges are fractions
+    # of is one carrier cycle - see _shape, and idle_volts, which has always
+    # passed it this.
+    y = _shape(wvtp, ph, num, 1.0 / freq, arb, hold, duty_over=duty_over)
     if y is None:
         return None
     if bursting is None:
