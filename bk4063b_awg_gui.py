@@ -121,14 +121,6 @@ MAX_ARB_NAME = 11
 # to choose blind.
 ARB_BOX = 68
 
-# Widgets that already use Space/arrows themselves, so the global shortcuts stay
-# out of their way - typing in the prefix box must not toggle an output.
-KEY_OWNERS = {
-    "Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox",
-    "Checkbutton", "TCheckbutton", "Radiobutton", "TRadiobutton",
-    "Button", "TButton",
-}
-
 # BSWV parameters: (key, label, wave types it applies to). The panel shows them
 # all and greys out the ones the selected type has no use for, so the layout
 # does not jump around when the type changes.
@@ -1154,10 +1146,18 @@ def safe_name(text):
 
 
 def fmt_value(raw):
-    """Normalise an instrument reply into what the panel displays."""
+    """Normalise an instrument reply into what the panel displays.
+
+    Ten significant figures, not the six a bare %g gives. At six, a 10.000001
+    MHz carrier reads back as 1e+07 and a 123.456789 MSa/s TrueArb clock as
+    1.23457e+08. Nothing was ever sent wrong by that - a cell nobody typed in
+    is not sent - but `inst_vals` kept the same rounded string, so the panel
+    could sit a part in a million away from the generator and still say it was
+    in sync, with no asterisk anywhere to say otherwise.
+    """
     raw = str(raw).strip()
     try:
-        return f"{float(raw):g}"
+        return f"{float(raw):.10g}"
     except ValueError:
         return raw
 
@@ -1677,6 +1677,7 @@ class App:
         self.prefix = tk.StringVar(value="awg")
         self.confirm_output = tk.BooleanVar(value=True)
         self.save_btn = self.recall_btn = self.mem_btn = None
+        self.connect_btn = None
 
         self.seq_win = None
         self.seq_data = [dict(SEQ_DEFAULT)]
@@ -1710,7 +1711,9 @@ class App:
         top.pack(fill="x", **pad)
         self.status = ttk.Label(top, text="Not connected", foreground="#a00")
         self.status.pack(side="left")
-        ttk.Button(top, text="Connect", command=self.do_connect).pack(side="right")
+        self.connect_btn = ttk.Button(top, text="Connect",
+                                      command=self.do_connect)
+        self.connect_btn.pack(side="right")
         ttk.Button(top, text="Load/save setups...",
                    command=self.do_setups).pack(side="right", padx=(0, 6))
         # Both channels together, for the common case of an experiment that
@@ -3333,10 +3336,15 @@ class App:
         for ch in CHANNELS:
             getattr(self, f"out_btn{ch}").configure(state=state)
         self.both_btn.configure(state=state)
-        # Refresh reads the local Waveforms folder as well as the generator,
-        # and that half works with nothing attached.
-        if self.mem_btn is not None:
-            self.mem_btn.configure(state="disabled" if busy else "normal")
+        # Neither of these is gated on an instrument being attached. Refresh
+        # reads the local Waveforms folder as well as the generator, and that
+        # half works with nothing there; Connect is how a dropped USB link gets
+        # picked up again. Both do have to stand aside while a worker thread is
+        # mid-transfer - connect() closes the VISA session, and closing it
+        # under an Apply leaves the channel half written.
+        for btn in (self.mem_btn, self.connect_btn):
+            if btn is not None:
+                btn.configure(state="disabled" if busy else "normal")
         self.repaint_outputs()
         self.upload_btn.configure(
             state="normal" if live and self.arb_samples is not None else "disabled")
@@ -3537,6 +3545,13 @@ class App:
     # -- actions -----------------------------------------------------------
 
     def do_connect(self):
+        # The same guard every other action has. Without it, a click here
+        # during an Apply, an upload or a read closed the VISA session the
+        # worker thread was still writing to.
+        if self.busy:
+            return
+        self.set_busy(True)
+
         def work():
             try:
                 idn = self.awg.connect()
@@ -3812,7 +3827,22 @@ class App:
         """Adopt a set of samples, wherever they came from - a file, a built
         shape or pasted text. All three land here so they share the column
         picker, the preview and the upload button."""
-        self.arb_table = np.asarray(table, dtype=np.float64)
+        table = np.asarray(table, dtype=np.float64)
+        if table.shape[0] < 2:
+            # Two points is the least that is a waveform, and the least the
+            # generator will store. Refused here rather than downstream,
+            # because an empty record takes min()/max() in pick_column and
+            # np.max() in do_upload with it - and under pythonw that failure
+            # is invisible, so the button simply does nothing.
+            self.log(f"  {source}: {table.shape[0]} sample(s) - not enough to "
+                     f"be a waveform, so nothing was loaded.")
+            messagebox.showerror(
+                "Not enough samples",
+                f"{source} has {table.shape[0]} sample(s).\n\n"
+                f"A waveform needs at least 2. The pending record has been "
+                f"left as it was.")
+            return
+        self.arb_table = table
         self.arb_source = source
         ncols = self.arb_table.shape[1]
         labels = [f"{i + 1}: {names[i]}" if names and i < len(names)
