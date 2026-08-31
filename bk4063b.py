@@ -698,6 +698,18 @@ class BK4063B:
         for ch, groups in state["channels"].items():
             ch = int(ch)
             prefix = self._ch(ch)
+            outp = parse_reply(groups["OUTP"])
+
+            # The declared load rescales amplitude, so it has to land before
+            # BSWV - the same rule apply_channel spells out, and for the same
+            # reason. Left out of the restore entirely, as it was, a 1.5 Vpp
+            # snapshot taken into 50 ohm came back as 0.75 Vpp on a generator
+            # sitting at HiZ, and the switch at the end of this loop then put
+            # that on the output.
+            terms = [f"{key},{_fmt(outp[key])}" for key in ("LOAD", "PLRT")
+                     if outp.get(key) not in (None, "")]
+            if terms:
+                self.write(f"{prefix}:OUTP {','.join(terms)}")
 
             # Order is load-bearing. Selecting an arb forces WVTP,ARB, so ARWV
             # has to precede BSWV; writing BSWV clears any active modulation, so
@@ -747,7 +759,7 @@ class BK4063B:
                 if args:
                     self.write(f"{prefix}:{verb} {lead}{args}")
 
-            self.write(f"{prefix}:OUTP {parse_reply(groups['OUTP']).get('STATE', 'OFF')}")
+            self.write(f"{prefix}:OUTP {outp.get('STATE', 'OFF')}")
 
 
 if __name__ == "__main__":
