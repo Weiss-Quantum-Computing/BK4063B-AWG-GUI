@@ -4342,21 +4342,24 @@ class App:
             return
         self._del_press_raw(key)
 
-    def _await_delete(self, before, lockout):
-        """Wait for a confirmed delete to actually land. Instrument thread only.
+    def _await_delete(self, before, lockout, accepted_at):
+        """Wait for a confirmed delete to land AND the panel to unlock.
 
-        The generator locks its front panel for about four seconds after Accept,
-        and keys sent inside that window are swallowed - so the next cursor
-        step would be lost and the Delete after it would land on the drive row
-        and remove nothing. Waiting is not optional.
+        Instrument thread only. Two conditions, and the second is the one that
+        is easy to miss: the file has to leave the list, and `lockout` seconds
+        have to have passed since Accept was pressed.
 
-        Watched for rather than slept through: this polls until the file really
-        leaves the list, so a delete that finishes early costs only what it
-        took, and a slow one is still waited out. A query that fails while the
-        panel is busy is not an error here - the instrument is simply not ready
-        to answer yet, so it is asked again.
+        Both, because the list catches up well before the panel does. Waiting
+        only for the list looked right and deleted the first file, then had the
+        second file's cursor step swallowed by the tail of the lockout - which
+        left its Delete pointing at the drive row, removing nothing, and
+        stopped the run one file in. The clock therefore runs from the Accept
+        press rather than from whenever the list happened to catch up.
 
-        Returns the list as last read, and whether it changed.
+        A query that fails while the panel is busy is not an error here - the
+        instrument is simply not ready to answer yet, so it is asked again.
+
+        Returns the list as last read, and whether the file went.
         """
         # Deliberately not cut short by Stop. By the time this is called the
         # delete has already been confirmed on the instrument, so the only
@@ -4364,20 +4367,21 @@ class App:
         # would report a file that did go as one that did not. Stop is honoured
         # at the top of the loop instead, which is where it can prevent
         # something rather than just stop watching it.
-        deadline = time.time() + max(lockout, 1.0) * 3.0
+        unlocked_at = accepted_at + max(lockout, 0.0)
+        deadline = accepted_at + max(lockout, 1.0) * 3.0
         after = list(before)
+        gone = False
         while time.time() < deadline:
             time.sleep(0.5)
-            try:
-                after = self.device_names()
-            except Exception:
-                continue
-            if len(after) != len(before):
-                # The list has caught up. Give the panel a moment to finish
-                # unlocking before the next key goes at it.
-                time.sleep(0.6)
+            if not gone:
+                try:
+                    after = self.device_names()
+                except Exception:
+                    continue
+                gone = len(after) != len(before)
+            if gone and time.time() >= unlocked_at:
                 return after, True
-        return after, False
+        return after, gone
 
     def _del_run(self):
         """Delete N files, checking the count after each one."""
@@ -4444,8 +4448,13 @@ class App:
                         time.sleep(0.35)
                     self.awg.press(keys["Delete"])
                     time.sleep(0.5)
+                    # Timed from here, not from when the list catches up: the
+                    # panel stays locked for a while after the file has already
+                    # gone from STL?.
+                    accepted_at = time.time()
                     self.awg.press(keys["Accept"])
-                    after, landed = self._await_delete(before, lockout)
+                    after, landed = self._await_delete(before, lockout,
+                                                       accepted_at)
                     gone = [n for n in before if n not in after]
                     if len(gone) != 1:
                         # The whole safety net. A press that does not remove

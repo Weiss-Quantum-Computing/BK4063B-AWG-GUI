@@ -834,13 +834,20 @@ knob click clockwise) comes before Delete and Accept every time, not once at
 the start. Measured at the panel.
 
 Confirming a delete then **locks the front panel for about four seconds**, and
-keys sent inside that window are swallowed - which would lose the next cursor
-step and leave the Delete after it aimed at the drive row. So each file waits
-for its deletion to actually appear in `STL?` before the next begins, rather
-than sleeping a guessed interval: an early finish costs only what it took, and
-a slow one is still waited out. The lockout is a typed setting because it is a
-property of the instrument rather than of this app. It does mean a long run is
-slow - budget roughly five seconds a file.
+keys sent inside that window are swallowed - which loses the next cursor step
+and leaves the Delete after it aimed at the drive row.
+
+So each file waits on **two** things before the next one starts: the deletion
+has to show up in `STL?`, *and* the lockout has to have elapsed **measured from
+the Accept press**. Both, because the list catches up well before the panel
+does. Waiting on the list alone looks right and is not - it deletes the first
+file, then has the second file's cursor step eaten by the tail of the lockout,
+and the run stops one file in with `nothing was removed within 14 s`.
+
+The lockout is a typed setting, since it is a property of the instrument rather
+than of this app and a fuller directory may not behave the same. If a run stops
+that way, raise it. It does mean a long run is slow - budget roughly five
+seconds a file, so about an hour for six hundred.
 
 Which keys those are is confirmed once, with you watching the screen, and
 **every press after that is checked against the stored-waveform count**: a
