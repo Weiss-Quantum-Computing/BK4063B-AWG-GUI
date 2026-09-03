@@ -815,7 +815,10 @@ them:
 
 - `WVDT POS,/Local/ZDIR,WVNM,ZF1` stores `ZF1` and quietly drops the
   subdirectory. The file then reports `POS, /Local` like every other, so the
-  field is accepted and ignored rather than refused.
+  field is accepted and ignored rather than refused. **This is not just because
+  the folder did not exist**: repeated against a `FOLDER_1` made at the panel,
+  `POS,/Local/FOLDER_1` still put the file in the root, still reporting
+  `POS, /Local`. The parameter is inert.
 - A forward slash in the name is rejected in silence — nothing is created.
 - A backslash is an ordinary character, so `ZDIR\ZF3` is one file with an
   awkward name, not a file in a folder.
@@ -825,10 +828,15 @@ them:
 An earlier version of this section said flatly that there are no folders, on
 the strength of a Store/Recall menu read out of the **SDG1000X** manual. That
 is a different instrument, and its menu is not this one's — the 4063B's panel
-does offer it. Whether a waveform placed in a folder can still be listed by
-`STL?` or selected by `ARWV NAME` is untested; if it cannot, then filing
-waveforms away would hide them from this app entirely, which is the thing to
-check before organising anything that way.
+does offer it.
+
+So a folder can be made, and nothing sent over USB can put anything in it. The
+one case left is a waveform moved into a folder **at the panel**: if `STL?`
+then stops listing it, this app goes blind to that waveform — the memory list,
+the preview, the Arb drop-down and the delete loop all read the same listing.
+Worth one check before filing anything away: move a single waveform into a
+folder at the panel, press **Refresh**, and see whether it is still in the
+list.
 
 If the front-panel order really matters, the only lever is a naming scheme:
 files that share everything but a trailing number come back in that number's
