@@ -809,14 +809,26 @@ does not take out one campaign**, because the order does not group by stem. And
 **the list shifts as you delete**, which is why the delete loop reports the name
 that actually went rather than assuming one.
 
-**There are no folders**, which is the other thing worth ruling out. The
-readback header carries a `POS` field, so the firmware has some notion of a
-location — but `WVDT POS,/Local/ZDIR,WVNM,ZF1` stores `ZF1` and quietly drops
-the subdirectory, and the file then reports `POS, /Local` like everything else.
-A forward slash in the name is rejected in silence, nothing created. A
-backslash is taken as an ordinary character, so `ZDIR\ZF3` is one file with an
-awkward name rather than a file in a folder. The Store/Recall menu has no
-"new folder" either — File Type, Browse, Save, Recall, Delete, Copy, Paste.
+**Folders exist, but not over SCPI.** The front panel can make one — that is
+measured, not inferred. What the remote interface cannot do is create or see
+them:
+
+- `WVDT POS,/Local/ZDIR,WVNM,ZF1` stores `ZF1` and quietly drops the
+  subdirectory. The file then reports `POS, /Local` like every other, so the
+  field is accepted and ignored rather than refused.
+- A forward slash in the name is rejected in silence — nothing is created.
+- A backslash is an ordinary character, so `ZDIR\ZF3` is one file with an
+  awkward name, not a file in a folder.
+- `STL? USER` does not list a folder made at the panel. The listing enumerates
+  waveforms, and the SCPI view of storage is flat.
+
+An earlier version of this section said flatly that there are no folders, on
+the strength of a Store/Recall menu read out of the **SDG1000X** manual. That
+is a different instrument, and its menu is not this one's — the 4063B's panel
+does offer it. Whether a waveform placed in a folder can still be listed by
+`STL?` or selected by `ARWV NAME` is untested; if it cannot, then filing
+waveforms away would hide them from this app entirely, which is the thing to
+check before organising anything that way.
 
 If the front-panel order really matters, the only lever is a naming scheme:
 files that share everything but a trailing number come back in that number's
