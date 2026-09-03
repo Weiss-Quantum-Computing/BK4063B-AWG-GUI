@@ -780,31 +780,40 @@ one to play.
 
 ### How the generator orders its memory
 
-Not alphabetically, and not by when things were uploaded. `STL?` returns
-**physical slot order**, and an upload takes a free slot rather than the end of
-the list. Measured three ways on a generator holding 651 files:
+Not alphabetically, and not by when things were uploaded. **A file's
+position is decided by its name**, deterministically — upload order has nothing
+to do with it. Measured:
 
-- Four stems run *backwards*. `P92PX1C` has `i00..i09` at slots 619..647 and
-  then `i12..i20` at slots 0..15; `PRFRX1C` and `PR1PX1C` do the same. Those
-  campaigns filled to the end of the directory and wrapped to the front.
-- A file uploaded today landed at slot 623 of 650, not at the end.
-- Two test uploads landed at slots 450 and 455 of 652 — into holes, and not
-  even adjacent to each other.
+- Three files sent as `ZZORDC`, `ZZORDA`, `ZZORDB` came back at slots 424, 430,
+  436 — alphabetical, evenly spaced, *not* the order they were sent.
+- From those three, `ZZORDD`'s slot was predicted at 442. It landed at 443.
+- Six files sent as `ZZS003, ZZS000, ZZS005, ZZS001, ZZS004, ZZS002` came back
+  `ZZS000..ZZS005` in sequence, at slots 416, 422, 429, 436, 444, 451.
 
-That explains the structure: a campaign's iterations take consecutive free
-slots, so they stay in sequence (29 of 33 stems are in ascending slot order),
-but survivors of earlier campaigns sit in the slots between, which is what
-interleaves five or so stems through any dozen names.
+The function is hash-like rather than alphabetical: names differing in their
+last characters land near each other and in order, while unrelated names
+scatter, and position correlates with nothing simple across the whole list
+(character sum, length, first or last character all give |r| < 0.12). That
+accounts for everything the list looks like — a campaign's iterations differ
+only in the trailing digits, so they stay together and in sequence (29 of 33
+stems are in ascending slot order), while different stems land at unrelated
+positions and interleave. The four stems that appear to "run backwards" are
+that hash wrapping round, not a directory filling up.
 
-The practical consequences. **Deleting from the top does not take out one
-campaign**, because slot order does not group by stem. **The list keeps
-shifting as you delete**, which is why the delete loop reports the name that
-actually went instead of assuming one. And **the order cannot be rearranged in
-place** — there is no rename or move — so the only way to impose one is to
-empty the generator and upload again in the order you want. Onto an empty
-generator there are no holes to fall into, so the order sent should be the
-order that comes back; that is reasoning from the above rather than a
-measurement, so upload two and check before committing six hundred to it.
+The practical consequences, and the first is the one that saves an hour.
+**Emptying the generator and uploading again in a chosen order does not
+reorganise anything** — the same names give the same arrangement back. There is
+no rename or move either, so the generator's own ordering is not ours to
+change; the only lever is what the files are called. **Deleting from the top
+does not take out one campaign**, because the order does not group by stem. And
+**the list shifts as you delete**, which is why the delete loop reports the name
+that actually went rather than assuming one.
+
+If the front-panel order really matters, the lever is a naming scheme: a common
+prefix with a sortable suffix comes back in sequence, as `ZZS000..ZZS005` did.
+That costs re-uploading everything under new names, inside an 11-character
+limit, and the descriptive stems with it — which is a steep price for an
+ordering you mostly read through this app anyway.
 
 What *can* be fixed without touching the generator is every list the app shows.
 The memory list and the **Arb wave** drop-down are sorted by name, with a

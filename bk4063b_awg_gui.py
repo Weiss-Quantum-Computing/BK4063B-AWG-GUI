@@ -4505,14 +4505,13 @@ class App:
         how the ones worth keeping go back. It is also the only way to change
         the order the generator holds them in.
 
-        That order is physical slot order, and an upload takes a free slot
-        rather than the end of the list - measured, two test uploads landed at
-        slots 450 and 455 of 652 rather than appending. So while the generator
-        still holds files, the order this sends in is not the order that comes
-        back. Onto an empty generator there are no holes to fall into and the
-        order should be the order sent, but that is reasoning rather than a
-        measurement, and it is worth checking with two files before trusting it
-        with six hundred.
+        It does NOT set the order they end up in. The generator decides a
+        file's position from its name, not from when it arrived: six files sent
+        as 003, 000, 005, 001, 004, 002 came back as 000..005 in sequence, and
+        a fourth file's slot was predicted from three earlier ones and landed
+        one slot off. So uploading in a chosen order achieves nothing, and
+        neither would emptying the generator first - the same names give the
+        same arrangement back.
         """
         if self.up_win is not None and self.up_win.winfo_exists():
             self.up_win.lift()
@@ -4536,10 +4535,10 @@ class App:
             "Sends local copies from Waveforms/ back to the generator, in the "
             "order they are listed here. A name already on the generator is "
             "overwritten rather than duplicated.\n\n"
-            "The generator stores files in physical slot order and an upload "
-            "takes a free slot, so onto a generator that still holds files "
-            "this order is not what comes back. Onto an empty one it should "
-            "be - upload two first and check before doing the lot.")
+            "This does not set the order the generator holds them in. It "
+            "decides that from the file name, not from when the file arrived, "
+            "so sending them in a different order changes nothing - and nor "
+            "would emptying the generator first. Names are the only lever.")
         ).pack(anchor="w", padx=10, pady=(10, 6))
 
         r = ttk.Frame(win)
