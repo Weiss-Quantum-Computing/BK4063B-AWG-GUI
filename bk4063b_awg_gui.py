@@ -4190,7 +4190,11 @@ class App:
             "promising to delete a name you picked.\n\n"
             "The list also drops back to the 'Local C:' drive row after every "
             "delete, so each file takes a cursor step, then Delete, then Accept. "
-            "That is why the order below is what it is.")
+            "That is why the order below is what it is.\n\n"
+            "Confirming a delete then locks the panel for about four seconds. "
+            "Keys sent inside that window are swallowed, so each file waits for "
+            "the deletion to actually show up in the list before the next one "
+            "starts - which is why a long run is not quick.")
         ).pack(anchor="w", padx=10, pady=(10, 6))
 
         self.del_state = ttk.Label(win, justify="left", foreground="#060")
@@ -4246,9 +4250,19 @@ class App:
         self.del_count = tk.StringVar(value="1")
         ttk.Entry(r, textvariable=self.del_count, width=8).pack(side="left",
                                                                 padx=(4, 10))
+        ttk.Label(r, text="Panel lockout (s):").pack(side="left")
+        # Confirming a delete locks the generator's front panel for about four
+        # seconds - measured at the bench. Typed rather than fixed because it
+        # is a property of the instrument, not of this app, and a fuller or
+        # emptier directory may well not take the same time.
+        self.del_settle = tk.StringVar(value="4.5")
+        ttk.Entry(r, textvariable=self.del_settle, width=6).pack(
+            side="left", padx=(4, 10))
+        r1b = ttk.Frame(step2)
+        r1b.pack(fill="x", padx=8, pady=(0, 2))
         self.del_ack = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            r, variable=self.del_ack,
+            r1b, variable=self.del_ack,
             text="I understand this cannot be undone on the generator").pack(
                 side="left")
         r2 = ttk.Frame(step2)
@@ -4328,6 +4342,43 @@ class App:
             return
         self._del_press_raw(key)
 
+    def _await_delete(self, before, lockout):
+        """Wait for a confirmed delete to actually land. Instrument thread only.
+
+        The generator locks its front panel for about four seconds after Accept,
+        and keys sent inside that window are swallowed - so the next cursor
+        step would be lost and the Delete after it would land on the drive row
+        and remove nothing. Waiting is not optional.
+
+        Watched for rather than slept through: this polls until the file really
+        leaves the list, so a delete that finishes early costs only what it
+        took, and a slow one is still waited out. A query that fails while the
+        panel is busy is not an error here - the instrument is simply not ready
+        to answer yet, so it is asked again.
+
+        Returns the list as last read, and whether it changed.
+        """
+        # Deliberately not cut short by Stop. By the time this is called the
+        # delete has already been confirmed on the instrument, so the only
+        # question left is whether it landed - and giving up on the answer
+        # would report a file that did go as one that did not. Stop is honoured
+        # at the top of the loop instead, which is where it can prevent
+        # something rather than just stop watching it.
+        deadline = time.time() + max(lockout, 1.0) * 3.0
+        after = list(before)
+        while time.time() < deadline:
+            time.sleep(0.5)
+            try:
+                after = self.device_names()
+            except Exception:
+                continue
+            if len(after) != len(before):
+                # The list has caught up. Give the panel a moment to finish
+                # unlocking before the next key goes at it.
+                time.sleep(0.6)
+                return after, True
+        return after, False
+
     def _del_run(self):
         """Delete N files, checking the count after each one."""
         if self.busy or not self.awg.connected:
@@ -4341,6 +4392,14 @@ class App:
         except ValueError:
             messagebox.showerror("How many?", "Give a whole number of files.",
                                  parent=self.del_win)
+            return
+        try:
+            lockout = float(self.del_settle.get().strip())
+            if lockout < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Lockout", "Give the panel lockout in seconds, "
+                                            "e.g. 4.5.", parent=self.del_win)
             return
         if want < 1:
             return
@@ -4370,7 +4429,8 @@ class App:
             try:
                 before = self.device_names()
                 self.log(f"Deleting up to {want} file(s) from the generator "
-                         f"({len(before)} stored). Watch the screen.")
+                         f"({len(before)} stored), waiting out a {lockout:g} s "
+                         f"panel lockout after each. Watch the screen.")
                 for step in range(want):
                     if self.del_stop:
                         self.log("  stopped.")
@@ -4385,27 +4445,32 @@ class App:
                     self.awg.press(keys["Delete"])
                     time.sleep(0.5)
                     self.awg.press(keys["Accept"])
-                    time.sleep(0.6)
-                    after = self.device_names()
+                    after, landed = self._await_delete(before, lockout)
                     gone = [n for n in before if n not in after]
                     if len(gone) != 1:
                         # The whole safety net. A press that does not remove
                         # exactly one file means the panel is not where this
                         # thinks it is, and carrying on would be pressing keys
                         # blind into an unknown menu.
+                        why = ("nothing was removed within "
+                               f"{max(lockout, 1.0) * 3.0:.0f} s"
+                               if not landed else
+                               f"{len(gone)} files went, not one")
                         self.log(
-                            f"  STOPPING at file {step + 1}: expected one file to "
-                            f"go and {len(gone)} did ({len(before)} -> "
-                            f"{len(after)}). The softkeys are probably not the "
-                            f"ones this is sending, or the panel has moved off "
-                            f"the Store/Recall page.")
+                            f"  STOPPING at file {step + 1}: expected one file "
+                            f"to go and {why} ({len(before)} -> {len(after)}). "
+                            f"The keys are probably not the ones this is "
+                            f"sending, the panel has moved off the Store/Recall "
+                            f"page, or the lockout is longer than "
+                            f"{lockout:g} s.")
                         self.root.after(0, lambda: messagebox.showwarning(
                             "Delete stopped",
                             "A key press did not remove exactly one file, so the "
                             "run stopped rather than pressing keys blind.\n\n"
                             "Check the generator's screen: it should be on "
                             "Store/Recall with the file list showing. Then "
-                            "confirm the two softkeys again in step 1."))
+                            "confirm the three keys again in step 1, and if the "
+                            "panel was still busy, raise the lockout time."))
                         break
                     done += 1
                     names.append(gone[0])
