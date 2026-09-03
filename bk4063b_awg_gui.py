@@ -24,6 +24,7 @@ import os
 import queue
 import re
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -32,8 +33,8 @@ import numpy as np
 # The instrument layer lives in bk4063b.py, beside this file - the SCPI
 # ordering, the reply parser and the arb upload path are shared with anything
 # that scripts the generator rather than driving it from the panel.
-from bk4063b import (BK4063B, CHANNELS, MODE_VERBS, TARB_BLOCKS, dac_samples,
-                     parse_reply)
+from bk4063b import (BK4063B, CHANNELS, KEYS, MODE_VERBS, STORE_RECALL_KEYS,
+                     TARB_BLOCKS, dac_samples, parse_reply)
 
 try:
     import matplotlib
@@ -49,12 +50,16 @@ except ImportError:                       # everything but the preview still wor
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
                            "BK4063B-AWG-GUI", "config.json")
 
-# A copy of every waveform this app uploads, kept because the generator cannot
-# read a stored waveform back out: without it, a waveform uploaded in an earlier
-# session can never be drawn again. It lives beside the program rather than in
-# %APPDATA% so the samples are somewhere you can actually get at them, which
-# also makes the folder work in both directions - drop a .npy in here named to
-# match a waveform on the generator and the preview will use it.
+# A copy of every waveform this app uploads. It lives beside the program rather
+# than in %APPDATA% so the samples are somewhere you can actually get at them,
+# which also makes the folder work in both directions - drop a .npy or a .csv in
+# here named to match a waveform on the generator and the preview will use it.
+#
+# This used to be the only way a stored waveform could ever be seen again,
+# because the generator was believed not to hand one back. It does:
+# WVDT? USER,<name> answers with the samples, and 'Download copies' fetches
+# them. The folder is now a cache rather than the sole record - which is what
+# makes deleting from the generator recoverable.
 WAVE_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Waveforms")
 
 # One colour per channel, used for the trace, the checkbox and the split
@@ -1678,6 +1683,15 @@ class App:
         self.confirm_output = tk.BooleanVar(value=True)
         self.save_btn = self.recall_btn = self.mem_btn = None
         self.connect_btn = None
+        self.dl_btn = self.del_btn = None
+
+        # The delete window and the run it drives. `del_stop` is how the loop
+        # is asked to give up between files - it is checked by the worker
+        # thread, which is why it is a plain flag and not a widget state.
+        self.del_win = None
+        self.del_stop = False
+        self.del_keys = {"Delete": STORE_RECALL_KEYS["Delete"],
+                         "Accept": STORE_RECALL_KEYS["Delete"]}
 
         self.seq_win = None
         self.seq_data = [dict(SEQ_DEFAULT)]
@@ -2659,8 +2673,8 @@ class App:
         # Controls first, from the bottom up: the list is the part that should
         # give up space when the column runs short, not the buttons.
         ttk.Label(f, foreground="#666", justify="left", text=(
-            "No remote delete on this firmware - waveforms come off at the front\n"
-            "panel (Utility > Store/Recall). Re-uploading a name overwrites it.")
+            "There is no SCPI delete on this firmware, so Delete... presses the\n"
+            "front-panel keys for you. Re-uploading a name overwrites it.")
         ).pack(side="bottom", anchor="w", padx=6, pady=(0, 6))
 
         row = ttk.Frame(f)
@@ -2672,6 +2686,15 @@ class App:
                    command=self.do_forget).pack(side="left", padx=6)
         ttk.Button(row, text="Load to pending",
                    command=self.do_use_wave).pack(side="left")
+        # Downloading is what makes deleting safe, so it sits next to it.
+        self.dl_btn = ttk.Button(row, text="Download copies",
+                                 command=self.do_download_copies,
+                                 state="disabled")
+        self.dl_btn.pack(side="left", padx=(6, 0))
+        self.del_btn = ttk.Button(row, text="Delete from generator...",
+                                  command=self.do_delete_waveforms,
+                                  state="disabled")
+        self.del_btn.pack(side="left", padx=(6, 0))
 
         box = ttk.Frame(f)
         box.pack(fill="both", expand=True, padx=6, pady=(6, 0))
@@ -2732,6 +2755,7 @@ class App:
             samples = self.known_waves[name]
             self.mem_list.insert(
                 "end", f"{name:<18}{samples.size:>9,} pts  local copy only")
+        self._del_refresh_state()
 
     def selected_wave(self):
         picked = self.mem_list.curselection()
@@ -2775,10 +2799,23 @@ class App:
             return
         samples = self.known_waves.get(name)
         if samples is None:
-            self.log(f"No local copy of '{name}'. The generator holds it, but "
-                     "it will not read samples back over USB, so there is "
-                     "nothing here to load.")
-            return
+            # No local copy, but the generator will hand one over - so fetch it
+            # rather than refusing, which is what this did while the project
+            # believed a stored waveform could not be read back.
+            if not self.awg.connected:
+                self.log(f"No local copy of '{name}', and nothing is connected "
+                         f"to fetch it from.")
+                return
+            try:
+                samples = self.awg.read_waveform(name)
+                cache_save(name, samples)
+                self.known_waves[name] = samples
+                self.refresh_memory(self.device_waves)
+                self.log(f"No local copy of '{name}' - downloaded it from the "
+                         f"generator ({samples.size:,} pts) and kept a copy.")
+            except Exception as exc:
+                self.log(f"Could not read '{name}' off the generator: {exc}")
+                return
         samples = np.asarray(samples, dtype=np.float64).ravel()
         self.take_table(samples.reshape(-1, 1), None,
                         f"local copy of {name}", name)
@@ -3328,7 +3365,8 @@ class App:
         live = self.awg.connected and not busy
         state = "normal" if live else "disabled"
         buttons = [self.read_btn, self.apply_btn,
-                   self.save_btn, self.recall_btn]
+                   self.save_btn, self.recall_btn,
+                   self.dl_btn, self.del_btn]
         for btn in buttons:
             # Save and Recall live in a window that is usually not open.
             if btn is not None and btn.winfo_exists():
@@ -3991,9 +4029,8 @@ class App:
                 n = self.awg.upload_arb(ch, name, samples, normalize=norm)
                 self.log(f"Uploaded '{name}' ({n} pts) and selected it on CH{ch}")
                 # Keep the samples so the channel preview can draw this
-                # waveform whenever it is the one selected. The generator
-                # cannot read a stored waveform back out, so if we do not
-                # remember it here, nothing can ever show it.
+                # waveform whenever it is the one selected, without a round
+                # trip to fetch what we just sent.
                 self.known_waves[name] = dac_samples(samples, normalize=norm)
                 cache_save(name, self.known_waves[name])
                 blocks = {c: self.awg.read_channel(c) for c in CHANNELS}
@@ -4002,6 +4039,311 @@ class App:
                                                            overwrite=True))
             except Exception as exc:
                 self.log(f"ERROR uploading: {exc}")
+                self.root.after(0, lambda: self.set_busy(False))
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- generator memory: download, and delete via the front panel --------
+
+    def device_names(self):
+        """What the generator says it holds. Instrument thread only."""
+        return self.awg.list_waveforms(user_only=True)
+
+    def do_download_copies(self):
+        """Pull local copies off the generator for anything missing one.
+
+        This firmware answers WVDT? USER,<name>, so a waveform uploaded from
+        another machine - or in a session before this app kept copies - can be
+        fetched rather than lost. It is also what makes deleting safe: with a
+        copy on disk, a waveform taken off the generator can be put back.
+        """
+        if self.busy or not self.awg.connected:
+            return
+        self.set_busy(True)
+
+        def work():
+            got = failed = 0
+            try:
+                names = self.device_names()
+                todo = [n for n in names if n not in self.known_waves]
+                if not todo:
+                    self.log(f"Every one of the {len(names)} waveform(s) on the "
+                             f"generator already has a local copy.")
+                else:
+                    self.log(f"Downloading {len(todo)} waveform(s) with no local "
+                             f"copy, of {len(names)} on the generator...")
+                    for i, name in enumerate(todo, 1):
+                        try:
+                            samples = self.awg.read_waveform(name)
+                            if samples.size < 2:
+                                raise ValueError(f"{samples.size} sample(s) came back")
+                            cache_save(name, samples)
+                            self.known_waves[name] = samples
+                            got += 1
+                            self.log(f"  {i}/{len(todo)} {name}: "
+                                     f"{samples.size:,} pts")
+                        except Exception as exc:
+                            failed += 1
+                            self.log(f"  {i}/{len(todo)} {name}: FAILED - {exc}")
+                    self.log(f"Downloaded {got}, failed {failed}. "
+                             f"Local copies live in {WAVE_CACHE}")
+                fresh = self.device_names()
+                self.root.after(0, lambda: self.refresh_memory(fresh))
+            except Exception as exc:
+                self.log(f"ERROR downloading: {exc}")
+            finally:
+                self.root.after(0, lambda: self.set_busy(False))
+        threading.Thread(target=work, daemon=True).start()
+
+    def unbacked(self, names=None):
+        """Waveforms on the generator with no local copy - what a delete loses."""
+        names = self.device_waves if names is None else names
+        return [n for n in names if n not in self.known_waves]
+
+    def do_delete_waveforms(self):
+        """Delete stored waveforms by driving the front panel.
+
+        Its own window because it is a procedure rather than a button: this
+        firmware exposes no SCPI delete at all - WVDT DEL, STL DEL,
+        DEL_STORE_FILE, DELETE, MMEM and eighteen other spellings are accepted
+        in silence and do nothing - so the only route is Store/Recall on the
+        front panel, reached with VKEY.
+
+        Which softkey is Delete and which is Accept is not something this app
+        can read back, so it is confirmed once with somebody watching the
+        generator's screen, and every press after that is checked against the
+        stored-waveform count. A press that does not remove exactly one file
+        stops the run where it stands.
+        """
+        if self.del_win is not None and self.del_win.winfo_exists():
+            self.del_win.lift()
+            self.del_win.focus_force()
+            return
+        if not self.awg.connected:
+            messagebox.showerror("Not connected",
+                                 "Connect to the generator first.")
+            return
+
+        win = self.del_win = tk.Toplevel(self.root)
+        win.title("Delete waveforms from the generator")
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._del_close)
+
+        ttk.Label(win, justify="left", foreground="#444", wraplength=620, text=(
+            "This firmware has no SCPI delete, so the app presses the front-panel "
+            "keys for you: Store/Recall, then Delete, then Accept. Watch the "
+            "generator's screen while you set this up.\n\n"
+            "This deletes from the generator only. The local copies in "
+            "Waveforms/ are not touched - a name deleted here stays in the list "
+            "below as 'local copy only' and can be uploaded again. Clearing out "
+            "that folder is a separate job, and yours.\n\n"
+            "The front panel deletes whichever file the cursor is on, and that "
+            "cursor cannot be read back over USB - so this deletes from wherever "
+            "the cursor sits and reports which name actually went, rather than "
+            "promising to delete a name you picked. Use the knob on the "
+            "generator to put the cursor where you want it.")
+        ).pack(anchor="w", padx=10, pady=(10, 6))
+
+        self.del_state = ttk.Label(win, justify="left", foreground="#060")
+        self.del_state.pack(anchor="w", padx=10, pady=(0, 6))
+
+        step1 = ttk.LabelFrame(win, text="1. Confirm the softkeys, watching the screen")
+        step1.pack(fill="x", padx=10, pady=4)
+        r0 = ttk.Frame(step1)
+        r0.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Button(r0, text="Open Store/Recall",
+                   command=lambda: self._del_press_raw("KB_STORE_RECALL")).pack(
+                       side="left")
+        ttk.Label(r0, foreground="#666", text=(
+            "  the screen should show the file list, with Delete as the fifth "
+            "softkey")).pack(side="left")
+
+        softkeys = [k for k in KEYS if k.startswith("KB_FUNC")]
+        for role, hint in (("Delete", "the screen should ask 'Delete the file?'"),
+                           ("Accept", "the file should disappear from the list")):
+            r = ttk.Frame(step1)
+            r.pack(fill="x", padx=8, pady=2)
+            ttk.Label(r, text=f"{role} softkey:", width=14).pack(side="left")
+            var = tk.StringVar(value=self.del_keys[role])
+            setattr(self, f"del_key_{role}", var)
+            ttk.Combobox(r, textvariable=var, values=softkeys, width=10,
+                         state="readonly").pack(side="left")
+            ttk.Button(r, text="Press it",
+                       command=lambda ro=role: self._del_press_test(ro)).pack(
+                           side="left", padx=6)
+            ttk.Label(r, foreground="#666", text=hint).pack(side="left")
+
+        step2 = ttk.LabelFrame(win, text="2. Delete")
+        step2.pack(fill="x", padx=10, pady=4)
+        r = ttk.Frame(step2)
+        r.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(r, text="How many files to delete:").pack(side="left")
+        self.del_count = tk.StringVar(value="1")
+        ttk.Entry(r, textvariable=self.del_count, width=8).pack(side="left",
+                                                                padx=(4, 10))
+        self.del_ack = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            r, variable=self.del_ack,
+            text="I understand this cannot be undone on the generator").pack(
+                side="left")
+        r2 = ttk.Frame(step2)
+        r2.pack(fill="x", padx=8, pady=(2, 8))
+        self.del_go = ttk.Button(r2, text="Delete", command=self._del_run)
+        self.del_go.pack(side="left")
+        ttk.Button(r2, text="Stop", command=self._del_request_stop).pack(
+            side="left", padx=6)
+        ttk.Button(r2, text="Close", command=self._del_close).pack(side="left")
+        self.del_note = ttk.Label(r2, text="", foreground="#666")
+        self.del_note.pack(side="left", padx=12)
+
+        self._del_refresh_state()
+
+    def _del_close(self):
+        self.del_stop = True
+        if self.del_win is not None:
+            self.del_win.destroy()
+        self.del_win = None
+
+    def _del_request_stop(self):
+        self.del_stop = True
+        self.log("Delete: stop requested - finishing the file in progress.")
+
+    def _del_refresh_state(self):
+        """Say how much of what is on the generator could be put back."""
+        if self.del_win is None or not self.del_win.winfo_exists():
+            return
+        total = len(self.device_waves)
+        missing = self.unbacked()
+        if not total:
+            text, colour = "Press Refresh first - nothing read from the generator yet.", "#c60"
+        elif not missing:
+            text = (f"All {total} waveform(s) on the generator have a local copy "
+                    f"in Waveforms/, so anything deleted can be uploaded again.")
+            colour = "#060"
+        else:
+            text = (f"{len(missing)} of {total} waveform(s) have NO local copy and "
+                    f"would be gone for good: "
+                    + ", ".join(missing[:6])
+                    + (f" and {len(missing) - 6} more" if len(missing) > 6 else "")
+                    + "\nPress 'Download copies' in the memory panel first.")
+            colour = "#c60"
+        self.del_state.configure(text=text, foreground=colour)
+
+    def _del_press_raw(self, key):
+        """Send one key and say what happened to the file count."""
+        if self.busy or not self.awg.connected:
+            return
+        self.set_busy(True)
+
+        def work():
+            try:
+                before = self.device_names()
+                self.awg.press(key)
+                time.sleep(0.6)
+                after = self.device_names()
+                gone = [n for n in before if n not in after]
+                self.log(f"Pressed {key}: {len(before)} -> {len(after)} file(s)"
+                         + (f", removed {', '.join(gone)}" if gone else ""))
+                self.root.after(0, lambda: self.refresh_memory(after))
+                self.root.after(0, self._del_refresh_state)
+            except Exception as exc:
+                self.log(f"ERROR pressing {key}: {exc}")
+            finally:
+                self.root.after(0, lambda: self.set_busy(False))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _del_press_test(self, role):
+        """Press one of the two softkeys on its own, and remember the choice."""
+        var = getattr(self, f"del_key_{role}", None)
+        if var is not None:
+            self.del_keys[role] = var.get()
+        self._del_press_raw(self.del_keys[role])
+
+    def _del_run(self):
+        """Delete N files, checking the count after each one."""
+        if self.busy or not self.awg.connected:
+            return
+        for role in ("Delete", "Accept"):
+            var = getattr(self, f"del_key_{role}", None)
+            if var is not None:
+                self.del_keys[role] = var.get()
+        try:
+            want = int(float(self.del_count.get().strip()))
+        except ValueError:
+            messagebox.showerror("How many?", "Give a whole number of files.",
+                                 parent=self.del_win)
+            return
+        if want < 1:
+            return
+        if not self.del_ack.get():
+            messagebox.showerror(
+                "Not confirmed",
+                "Tick the box to confirm you know this cannot be undone on the "
+                "generator.", parent=self.del_win)
+            return
+        missing = self.unbacked()
+        if missing and not messagebox.askokcancel(
+                "Some have no local copy",
+                f"{len(missing)} waveform(s) on the generator have no local copy, "
+                f"so if the cursor reaches one it is gone for good:\n\n"
+                + ", ".join(missing[:12])
+                + (f"\n...and {len(missing) - 12} more" if len(missing) > 12 else "")
+                + "\n\nDownload copies first, or continue anyway?",
+                parent=self.del_win):
+            return
+
+        self.del_stop = False
+        self.set_busy(True)
+        keys = dict(self.del_keys)
+
+        def work():
+            done, names = 0, []
+            try:
+                before = self.device_names()
+                self.log(f"Deleting up to {want} file(s) from the generator "
+                         f"({len(before)} stored). Watch the screen.")
+                for step in range(want):
+                    if self.del_stop:
+                        self.log("  stopped.")
+                        break
+                    self.awg.press(keys["Delete"])
+                    time.sleep(0.5)
+                    self.awg.press(keys["Accept"])
+                    time.sleep(0.6)
+                    after = self.device_names()
+                    gone = [n for n in before if n not in after]
+                    if len(gone) != 1:
+                        # The whole safety net. A press that does not remove
+                        # exactly one file means the panel is not where this
+                        # thinks it is, and carrying on would be pressing keys
+                        # blind into an unknown menu.
+                        self.log(
+                            f"  STOPPING at file {step + 1}: expected one file to "
+                            f"go and {len(gone)} did ({len(before)} -> "
+                            f"{len(after)}). The softkeys are probably not the "
+                            f"ones this is sending, or the panel has moved off "
+                            f"the Store/Recall page.")
+                        self.root.after(0, lambda: messagebox.showwarning(
+                            "Delete stopped",
+                            "A key press did not remove exactly one file, so the "
+                            "run stopped rather than pressing keys blind.\n\n"
+                            "Check the generator's screen: it should be on "
+                            "Store/Recall with the file list showing. Then "
+                            "confirm the two softkeys again in step 1."))
+                        break
+                    done += 1
+                    names.append(gone[0])
+                    self.log(f"  {done}/{want} deleted {gone[0]} "
+                             f"({len(after)} left)")
+                    before = after
+                final = self.device_names()
+                self.log(f"Deleted {done} file(s): "
+                         + (", ".join(names) if names else "none")
+                         + f". {len(final)} left on the generator.")
+                self.root.after(0, lambda: self.refresh_memory(final))
+                self.root.after(0, self._del_refresh_state)
+            except Exception as exc:
+                self.log(f"ERROR deleting: {exc}")
+            finally:
                 self.root.after(0, lambda: self.set_busy(False))
         threading.Thread(target=work, daemon=True).start()
 

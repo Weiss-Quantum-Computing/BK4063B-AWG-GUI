@@ -762,11 +762,38 @@ which meant a waveform dropped into `Waveforms/` - written there by a script, or
 pulled in with the project - stayed invisible until the app was restarted, with
 the list going on saying `no local copy` about a file sitting right there.
 
-**There is no remote delete.** Confirmed by probing rather than assumed: `WVDT
-DEL`, `STL DEL`, `DELETE` and the whole SCPI `MMEM` subsystem all return
-`-113 "Undefined header"`, and `C1:WVDT DEL,<name>` is accepted with no error and
-no effect. Waveforms come off at the front panel, Utility > Store/Recall.
-Re-uploading a name overwrites it, so reusing names keeps the list from growing.
+**Download copies** fetches the samples of every waveform on the generator that
+has no local copy, straight off the instrument with `WVDT? USER,<name>`. This
+project spent a long time believing that command did not exist here and treating
+`Waveforms/` as the only record an upload ever left. It does exist, the folder is
+a cache rather than the sole copy, and a waveform uploaded from another machine
+or in a session before this app kept copies can be pulled back rather than lost.
+It is also what makes deleting safe: with a copy on disk, anything taken off the
+generator can be put back. **Load to pending** now fetches too, rather than
+refusing, when the waveform you picked has no local copy.
+
+**There is no remote delete — but there is a remote front panel.** The SCPI
+half was confirmed by probing rather than assumed, twice over: `WVDT DEL`,
+`STL DEL`, `DELETE` and the whole `MMEM` subsystem return `-113 "Undefined
+header"`, while `C1:WVDT DEL,<name>`, `DEL_STORE_FILE <name>.bin` (which is
+real on some Siglent builds) and eighteen other spellings are accepted in
+silence and do nothing at all.
+
+What does work is `VKEY`, which presses a front-panel key. Measured:
+`VKEY VALUE,KB_MOD,STATE,1` switched the displayed channel's modulation on. So
+**Delete from generator...** drives Store/Recall the way your fingers would.
+Because the panel deletes whichever file the cursor is on, and that cursor
+cannot be read back, it deletes from wherever the cursor sits and reports which
+name actually went — rather than promising to delete one you picked. Put the
+cursor where you want it with the knob.
+
+Which softkey is Delete and which is Accept is confirmed once, with you
+watching the screen, and **every press after that is checked against the
+stored-waveform count**: a press that does not remove exactly one file stops
+the run rather than pressing keys blind into a menu it cannot see.
+
+Re-uploading a name still overwrites it, so reusing names keeps the list from
+growing in the first place.
 
 **Forget local copy** deletes only this app's copy of the samples; the waveform
 stays on the generator. **Load to pending** puts the selected waveform's local
@@ -821,8 +848,17 @@ out, the same way captured data does. The figures in this README live in
 opens on, and a folder of screenshots is not what you want to be looking at
 there.
 
-**Deleting** an uploaded waveform has to be done at the front panel
-(Utility -> Store/Recall) - the firmware exposes no SCPI for it.
+**Deleting** an uploaded waveform is a front-panel operation - the firmware
+exposes no SCPI for it - but the panel can be driven remotely with `VKEY`, which
+is what **Delete from generator...** does. See [Waveforms in generator
+memory](#waveforms-in-generator-memory).
+
+**Reading a waveform back** works: `WVDT? USER,<name>` returns a header and the
+raw signed 16-bit samples, and `BK4063B.read_waveform(name)` decodes them.
+Checked against four waveforms this app had uploaded and cached - same point
+counts, agreeing to 1.53e-05, which is one code in 16 bits and nothing more.
+**Download copies** fetches every waveform on the generator that has no local
+copy, which is what makes deleting recoverable.
 
 ## Command ordering
 
