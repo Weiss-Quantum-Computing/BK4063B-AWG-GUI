@@ -809,11 +809,25 @@ does not take out one campaign**, because the order does not group by stem. And
 **the list shifts as you delete**, which is why the delete loop reports the name
 that actually went rather than assuming one.
 
-If the front-panel order really matters, the lever is a naming scheme: a common
-prefix with a sortable suffix comes back in sequence, as `ZZS000..ZZS005` did.
-That costs re-uploading everything under new names, inside an 11-character
-limit, and the descriptive stems with it — which is a steep price for an
-ordering you mostly read through this app anyway.
+**There are no folders**, which is the other thing worth ruling out. The
+readback header carries a `POS` field, so the firmware has some notion of a
+location — but `WVDT POS,/Local/ZDIR,WVNM,ZF1` stores `ZF1` and quietly drops
+the subdirectory, and the file then reports `POS, /Local` like everything else.
+A forward slash in the name is rejected in silence, nothing created. A
+backslash is taken as an ordinary character, so `ZDIR\ZF3` is one file with an
+awkward name rather than a file in a folder. The Store/Recall menu has no
+"new folder" either — File Type, Browse, Save, Recall, Delete, Copy, Paste.
+
+If the front-panel order really matters, the only lever is a naming scheme:
+files that share everything but a trailing number come back in that number's
+order, which is why 29 of 33 stems are already ascending and why
+`ZZS000..ZZS005` came back in sequence. But sequential names give the right
+*order*, not contiguity — at 661 files consecutive names land 6 to 8 slots
+apart, interleaved with everything else, and different prefixes do not form
+blocks. So one prefix per campaign would not group campaigns; only a single
+flat sequence over every file (`W000`…`W660`) actually sorts the list, and that
+costs the descriptive stems inside an 11-character limit. A steep price for an
+ordering you mostly read through this app, where the lists are sorted already.
 
 What *can* be fixed without touching the generator is every list the app shows.
 The memory list and the **Arb wave** drop-down are sorted by name, with a
