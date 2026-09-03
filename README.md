@@ -830,13 +830,21 @@ the strength of a Store/Recall menu read out of the **SDG1000X** manual. That
 is a different instrument, and its menu is not this one's — the 4063B's panel
 does offer it.
 
-So a folder can be made, and nothing sent over USB can put anything in it. The
-one case left is a waveform moved into a folder **at the panel**: if `STL?`
-then stops listing it, this app goes blind to that waveform — the memory list,
-the preview, the Arb drop-down and the delete loop all read the same listing.
-Worth one check before filing anything away: move a single waveform into a
-folder at the panel, press **Refresh**, and see whether it is still in the
-list.
+So a folder can be made, and nothing sent over USB can put anything in it. Nor
+is there a move at the panel: filing one waveform away is Copy, then Paste
+inside the folder, then Delete the original — and that Delete carries the same
+four-second lockout as any other. Per file, for six hundred files, that is a
+longer job than the one the delete loop exists to solve. Folders are therefore
+not an organising option on this instrument, whatever `STL?` would have made of
+a waveform inside one.
+
+Which leaves the summary worth remembering: **the generator's own order is not
+worth fighting.** Upload order does nothing, `POS` does nothing, folders cost
+more than they return, and only a flat renaming of every file would sort it.
+The lists you actually read — the memory list and the **Arb wave** drop-down —
+are sorted by this app already, and a campaign named `STEM_iNN` keeps its
+iterations together and in sequence on the generator too, which is the one
+piece of ordering that comes free.
 
 If the front-panel order really matters, the only lever is a naming scheme:
 files that share everything but a trailing number come back in that number's
