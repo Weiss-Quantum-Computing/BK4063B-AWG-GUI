@@ -1144,6 +1144,20 @@ def cache_forget(name):
     return gone
 
 
+def sort_key(name):
+    """Group a name under its stem, with iterations in numeric order.
+
+    Plain alphabetical puts `_i10` before `_i2`, which is the wrong order for
+    the thing these names are actually counting. Splitting the trailing digits
+    out and sorting them as a number keeps a campaign's iterations together and
+    in sequence, which is the ordering a list of these is wanted in.
+    """
+    match = re.match(r"^(.*?)_?i(\d+)$", str(name))
+    if match and match.group(1):
+        return (match.group(1).lower(), 0, int(match.group(2)), "")
+    return (str(name).lower(), 1, 0, str(name))
+
+
 def safe_name(text):
     """Trim a typed prefix down to something legal in a filename."""
     out = "".join("_" if c in BAD_NAME_CHARS else c for c in text.strip())
@@ -1684,6 +1698,10 @@ class App:
         self.save_btn = self.recall_btn = self.mem_btn = None
         self.connect_btn = None
         self.dl_btn = self.del_btn = None
+        self.up_btn = None
+        self.mem_sorted = None        # the sort toggle, built with the panel
+        self.up_win = None
+        self.up_stop = False
 
         # The delete window and the run it drives. `del_stop` is how the loop
         # is asked to give up between files - it is checked by the worker
@@ -2700,6 +2718,23 @@ class App:
                                   command=self.do_delete_waveforms,
                                   state="disabled")
         self.del_btn.pack(side="left", padx=(6, 0))
+        self.up_btn = ttk.Button(row, text="Upload copies...",
+                                 command=self.do_upload_copies,
+                                 state="disabled")
+        self.up_btn.pack(side="left", padx=(6, 0))
+
+        # The generator's own order is physical slot order - not alphabetical,
+        # not the order things were uploaded in - so a name is hard to find in
+        # it once there are a few hundred. This sorts what the app shows;
+        # the generator's own front-panel list is not something we can reorder.
+        opts = ttk.Frame(f)
+        opts.pack(side="bottom", fill="x", padx=6)
+        self.mem_sorted = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, variable=self.mem_sorted,
+                        text="sort by name (untick to see the generator's own "
+                             "slot order)",
+                        command=lambda: self.refresh_memory(
+                            self.device_waves)).pack(side="left")
 
         box = ttk.Frame(f)
         box.pack(fill="both", expand=True, padx=6, pady=(6, 0))
@@ -2745,7 +2780,10 @@ class App:
         """Show what is on the generator and what we hold a local copy of."""
         self.device_waves = list(names or [])
         self.mem_list.delete(0, "end")
-        for name in self.device_waves:
+        shown = (sorted(self.device_waves, key=sort_key)
+                 if (self.mem_sorted is None or self.mem_sorted.get())
+                 else self.device_waves)
+        for name in shown:
             samples = self.known_waves.get(name)
             note = (f"{samples.size:>9,} pts" if samples is not None
                     else "  no local copy")
@@ -2753,7 +2791,8 @@ class App:
         # A cached waveform the generator no longer lists was deleted at the
         # front panel, or uploaded from another machine. Say so rather than
         # leaving a name that looks live.
-        for name in sorted(set(self.known_waves) - set(self.device_waves)):
+        for name in sorted(set(self.known_waves) - set(self.device_waves),
+                           key=sort_key):
             # Same points column as the rows above: the length is a property of
             # the copy we hold, so it reads out whether or not the generator
             # still lists the name.
@@ -3371,7 +3410,7 @@ class App:
         state = "normal" if live else "disabled"
         buttons = [self.read_btn, self.apply_btn,
                    self.save_btn, self.recall_btn,
-                   self.dl_btn, self.del_btn]
+                   self.dl_btn, self.del_btn, self.up_btn]
         for btn in buttons:
             # Save and Recall live in a window that is usually not open.
             if btn is not None and btn.winfo_exists():
@@ -3618,7 +3657,11 @@ class App:
             self.show_channel(ch, b, overwrite=overwrite)
         if names is not None:
             for ch in CHANNELS:
-                getattr(self, f"arbcombo{ch}").configure(values=names)
+                # Sorted, always: this is a drop-down of several hundred
+                # names that has to be picked from by eye, and the generator's
+                # own order is physical slot order.
+                getattr(self, f"arbcombo{ch}").configure(
+                    values=sorted(names, key=sort_key))
             self.log(f"User waveforms: {', '.join(names) if names else '(none)'}")
             self.refresh_memory(names)
         self.read_stamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -4377,6 +4420,191 @@ class App:
                 self.root.after(0, self._del_refresh_state)
             except Exception as exc:
                 self.log(f"ERROR deleting: {exc}")
+            finally:
+                self.root.after(0, lambda: self.set_busy(False))
+        threading.Thread(target=work, daemon=True).start()
+
+    def do_upload_copies(self):
+        """Send local copies back to the generator, in a chosen order.
+
+        The other half of Delete: once waveforms have been taken off, this is
+        how the ones worth keeping go back. It is also the only way to change
+        the order the generator holds them in.
+
+        That order is physical slot order, and an upload takes a free slot
+        rather than the end of the list - measured, two test uploads landed at
+        slots 450 and 455 of 652 rather than appending. So while the generator
+        still holds files, the order this sends in is not the order that comes
+        back. Onto an empty generator there are no holes to fall into and the
+        order should be the order sent, but that is reasoning rather than a
+        measurement, and it is worth checking with two files before trusting it
+        with six hundred.
+        """
+        if self.up_win is not None and self.up_win.winfo_exists():
+            self.up_win.lift()
+            self.up_win.focus_force()
+            return
+        if not self.awg.connected:
+            messagebox.showerror("Not connected",
+                                 "Connect to the generator first.")
+            return
+        if not self.known_waves:
+            messagebox.showerror("No local copies",
+                                 f"There are no waveforms in {WAVE_CACHE}.")
+            return
+
+        win = self.up_win = tk.Toplevel(self.root)
+        win.title("Upload local copies to the generator")
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._up_close)
+
+        ttk.Label(win, justify="left", foreground="#444", wraplength=560, text=(
+            "Sends local copies from Waveforms/ back to the generator, in the "
+            "order they are listed here. A name already on the generator is "
+            "overwritten rather than duplicated.\n\n"
+            "The generator stores files in physical slot order and an upload "
+            "takes a free slot, so onto a generator that still holds files "
+            "this order is not what comes back. Onto an empty one it should "
+            "be - upload two first and check before doing the lot.")
+        ).pack(anchor="w", padx=10, pady=(10, 6))
+
+        r = ttk.Frame(win)
+        r.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(r, text="Order:").pack(side="left")
+        self.up_order = tk.StringVar(value="name")
+        for label, value in (("by name, iterations in sequence", "name"),
+                             ("as the generator lists them", "slot")):
+            ttk.Radiobutton(r, text=label, value=value,
+                            variable=self.up_order,
+                            command=self._up_fill).pack(side="left", padx=(6, 0))
+
+        box = ttk.Frame(win)
+        box.pack(fill="both", expand=True, padx=10, pady=4)
+        self.up_list = tk.Listbox(box, height=14, width=52, selectmode="extended",
+                                  font=("Consolas", 9), exportselection=False)
+        bar = ttk.Scrollbar(box, orient="vertical", command=self.up_list.yview)
+        self.up_list.configure(yscrollcommand=bar.set)
+        self.up_list.pack(side="left", fill="both", expand=True)
+        bar.pack(side="left", fill="y")
+
+        r2 = ttk.Frame(win)
+        r2.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Button(r2, text="Select all",
+                   command=lambda: self.up_list.selection_set(0, "end")).pack(
+                       side="left")
+        ttk.Button(r2, text="Select none",
+                   command=lambda: self.up_list.selection_clear(0, "end")).pack(
+                       side="left", padx=6)
+        self.up_note = ttk.Label(r2, text="", foreground="#666")
+        self.up_note.pack(side="left", padx=10)
+
+        r3 = ttk.Frame(win)
+        r3.pack(fill="x", padx=10, pady=(2, 10))
+        ttk.Button(r3, text="Upload selected", command=self._up_run).pack(
+            side="left")
+        ttk.Button(r3, text="Stop", command=self._up_request_stop).pack(
+            side="left", padx=6)
+        ttk.Button(r3, text="Close", command=self._up_close).pack(side="left")
+
+        self._up_fill()
+
+    def _up_close(self):
+        self.up_stop = True
+        if self.up_win is not None:
+            self.up_win.destroy()
+        self.up_win = None
+
+    def _up_request_stop(self):
+        self.up_stop = True
+        self.log("Upload: stop requested - finishing the file in progress.")
+
+    def _up_names(self):
+        """The local copies, in the order the window is currently showing."""
+        names = list(self.known_waves)
+        if self.up_order.get() == "slot":
+            order = {n: i for i, n in enumerate(self.device_waves)}
+            return sorted(names, key=lambda n: (order.get(n, len(order)),
+                                                sort_key(n)))
+        return sorted(names, key=sort_key)
+
+    def _up_fill(self):
+        if self.up_win is None or not self.up_win.winfo_exists():
+            return
+        self.up_list.delete(0, "end")
+        for name in self._up_names():
+            on_gen = "on generator" if name in self.device_waves else "  --  "
+            self.up_list.insert(
+                "end", f"{name:<18}{self.known_waves[name].size:>9,} pts  {on_gen}")
+        self.up_note.configure(
+            text=f"{len(self.known_waves)} local copy(ies) in Waveforms/")
+
+    def _up_run(self):
+        if self.busy or not self.awg.connected:
+            return
+        picked = list(self.up_list.curselection())
+        if not picked:
+            messagebox.showerror("Nothing selected",
+                                 "Pick the waveforms to upload.",
+                                 parent=self.up_win)
+            return
+        names = self._up_names()
+        chosen = [names[i] for i in picked]
+        already = [n for n in chosen if n in self.device_waves]
+        if already and not messagebox.askokcancel(
+                "Overwrite on the generator?",
+                f"{len(already)} of the {len(chosen)} selected are already on "
+                f"the generator and will be overwritten:\n\n"
+                + ", ".join(already[:12])
+                + (f"\n...and {len(already) - 12} more" if len(already) > 12 else "")
+                + "\n\nContinue?", parent=self.up_win):
+            return
+        live = [ch for ch in CHANNELS if self.out_state.get(ch) == "ON"]
+        if live and self.confirm_output.get() and not messagebox.askokcancel(
+                "An output is ON",
+                " and ".join(f"CH{c}" for c in live)
+                + " is currently ON. Uploading does not select a waveform onto "
+                  "a channel, but the generator is busy while it writes.\n\n"
+                  "Continue?", parent=self.up_win):
+            return
+
+        self.up_stop = False
+        self.set_busy(True)
+
+        def work():
+            done, failed = 0, []
+            try:
+                self.log(f"Uploading {len(chosen)} local copy(ies), in the "
+                         f"order shown...")
+                for i, name in enumerate(chosen, 1):
+                    if self.up_stop:
+                        self.log("  stopped.")
+                        break
+                    try:
+                        # Stored without ARWV, so no channel's selection moves:
+                        # this is putting files back, not choosing one to play.
+                        samples = np.asarray(self.known_waves[name],
+                                             dtype=np.float64).ravel()
+                        codes = np.round(dac_samples(samples, normalize=False)
+                                         * 32767).astype("<i2").tobytes()
+                        self.awg.dev.write_raw(
+                            f"C1:WVDT WVNM,{name},WAVEDATA,".encode("ascii")
+                            + codes)
+                        self.awg.wait()
+                        done += 1
+                        self.log(f"  {i}/{len(chosen)} {name} "
+                                 f"({samples.size:,} pts)")
+                    except Exception as exc:
+                        failed.append(name)
+                        self.log(f"  {i}/{len(chosen)} {name}: FAILED - {exc}")
+                fresh = self.device_names()
+                self.log(f"Uploaded {done}, failed {len(failed)}. "
+                         f"{len(fresh)} now on the generator.")
+                if failed:
+                    self.log("  failed: " + ", ".join(failed))
+                self.root.after(0, lambda: self.refresh_memory(fresh))
+                self.root.after(0, self._up_fill)
+            except Exception as exc:
+                self.log(f"ERROR uploading: {exc}")
             finally:
                 self.root.after(0, lambda: self.set_busy(False))
         threading.Thread(target=work, daemon=True).start()

@@ -772,6 +772,47 @@ It is also what makes deleting safe: with a copy on disk, anything taken off the
 generator can be put back. **Load to pending** now fetches too, rather than
 refusing, when the waveform you picked has no local copy.
 
+**Upload copies...** sends local copies back, in the order they are listed —
+the other half of Delete, and the only way to change the order the generator
+holds them in. A name already there is overwritten rather than duplicated, and
+nothing is selected onto a channel: this puts files back, it does not choose
+one to play.
+
+### How the generator orders its memory
+
+Not alphabetically, and not by when things were uploaded. `STL?` returns
+**physical slot order**, and an upload takes a free slot rather than the end of
+the list. Measured three ways on a generator holding 651 files:
+
+- Four stems run *backwards*. `P92PX1C` has `i00..i09` at slots 619..647 and
+  then `i12..i20` at slots 0..15; `PRFRX1C` and `PR1PX1C` do the same. Those
+  campaigns filled to the end of the directory and wrapped to the front.
+- A file uploaded today landed at slot 623 of 650, not at the end.
+- Two test uploads landed at slots 450 and 455 of 652 — into holes, and not
+  even adjacent to each other.
+
+That explains the structure: a campaign's iterations take consecutive free
+slots, so they stay in sequence (29 of 33 stems are in ascending slot order),
+but survivors of earlier campaigns sit in the slots between, which is what
+interleaves five or so stems through any dozen names.
+
+The practical consequences. **Deleting from the top does not take out one
+campaign**, because slot order does not group by stem. **The list keeps
+shifting as you delete**, which is why the delete loop reports the name that
+actually went instead of assuming one. And **the order cannot be rearranged in
+place** — there is no rename or move — so the only way to impose one is to
+empty the generator and upload again in the order you want. Onto an empty
+generator there are no holes to fall into, so the order sent should be the
+order that comes back; that is reasoning from the above rather than a
+measurement, so upload two and check before committing six hundred to it.
+
+What *can* be fixed without touching the generator is every list the app shows.
+The memory list and the **Arb wave** drop-down are sorted by name, with a
+stem's iterations in numeric order — so `_i2` comes before `_i10` rather than
+after it. Untick **sort by name** to see the generator's own slot order
+instead. The generator's own front-panel list is still slot order; that one is
+not ours to sort.
+
 **There is no remote delete — but there is a remote front panel.** The SCPI
 half was confirmed by probing rather than assumed, twice over: `WVDT DEL`,
 `STL DEL`, `DELETE` and the whole `MMEM` subsystem return `-113 "Undefined
