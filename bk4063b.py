@@ -35,7 +35,7 @@ except ImportError:
 
 __all__ = ["BK4063B", "InstrumentError", "parse_reply", "dac_samples",
            "USB_ID", "CHANNELS", "CARR_KEYS", "TARB_BLOCKS", "MODE_VERB",
-           "MODE_VERBS"]
+           "MODE_VERBS", "KEYS", "STORE_RECALL_KEYS"]
 
 # USB vendor/product for the B&K 4060B series.
 USB_ID = "0xF4EC::0xEE38"
@@ -50,6 +50,46 @@ CHANNELS = (1, 2)
 # are from the programming guide's own CARR table.
 CARR_KEYS = {"WVTP", "FRQ", "PHSE", "AMP", "OFST", "SYM", "DUTY",
              "RISE", "FALL", "DLY", "STDEV", "MEAN"}
+
+# Front-panel keys, for VKEY. Measured on this generator: the name form
+# ("VKEY VALUE,KB_MOD,STATE,1") is accepted and really does press the key -
+# KB_MOD switched the displayed channel's modulation on. The numeric indices
+# are the programming guide's, kept because some builds take only those.
+#
+# Not every key here exists on this front panel. The 4063B is an SDG2000X-class
+# two-channel unit, so it has no dedicated SINE/SQUARE/RAMP/PULSE/NOISE/ARB
+# keys - those live behind KB_WAVES and the softkeys - and sending them does
+# nothing at all. That is worth knowing before reading a silent key as a
+# missing VKEY.
+KEYS = {
+    "KB_FUNC1": 28, "KB_FUNC2": 23, "KB_FUNC3": 18, "KB_FUNC4": 13,
+    "KB_FUNC5": 8, "KB_FUNC6": 3,
+    "KB_WAVES": 4, "KB_PARAMETER": 5, "KB_UTILITY": 11, "KB_HELP": 12,
+    "KB_MOD": 15, "KB_SWEEP": 16, "KB_BURST": 17,
+    "KB_STORE_RECALL": 70, "KB_CHANNEL": 72,
+    "KB_LEFT": 44, "KB_RIGHT": 40, "KB_UP": 45, "KB_DOWN": 39,
+    "KB_KNOB_LEFT": 177, "KB_KNOB_RIGHT": 175, "KB_KNOB_DOWN": 176,
+    "KB_NUMBER_0": 48, "KB_NUMBER_1": 49, "KB_NUMBER_2": 50,
+    "KB_NUMBER_3": 51, "KB_NUMBER_4": 52, "KB_NUMBER_5": 53,
+    "KB_NUMBER_6": 54, "KB_NUMBER_7": 55, "KB_NUMBER_8": 56,
+    "KB_NUMBER_9": 57, "KB_POINT": 46, "KB_NEGATIVE": 43,
+    "KB_OUTPUT1": 153, "KB_OUTPUT2": 152,
+}
+
+# The Store/Recall page, which is the only way to delete a stored waveform:
+# there is no SCPI for it. Page 1/2 carries exactly six entries for the six
+# softkeys, in this order, so the mapping below is what the menu implies.
+# It is a starting point and not a measurement - the panel is the authority,
+# which is why the app confirms it with somebody watching the screen before
+# it is used in a loop.
+STORE_RECALL_KEYS = {
+    "File Type": "KB_FUNC1",
+    "Browse":    "KB_FUNC2",
+    "Save":      "KB_FUNC3",
+    "Recall":    "KB_FUNC4",
+    "Delete":    "KB_FUNC5",
+    "Page":      "KB_FUNC6",
+}
 
 # Sweep and burst are not available while a channel's sample clock is TrueArb.
 # Measured, not inferred: BTWV STATE,ON and SWWV STATE,ON both read back OFF
@@ -400,6 +440,77 @@ class BK4063B:
         # 'STL M10, ExpFal, M100, ECG14' -- index/name pairs; keep the names.
         return fields[1::2]
 
+    def read_waveform(self, name: str):
+        """The samples of a stored waveform, in -1..+1, straight off the generator.
+
+        This firmware does answer WVDT? USER,<name>, which is worth stating
+        plainly because this project spent a long time believing it did not and
+        keeping local copies as the only way to ever see an upload again. The
+        reply is a header and then raw signed 16-bit little-endian codes:
+
+            WVDT POS,/Local,WVNM,X1,LENGTH,17604B,TYPE,6,WAVEDATA,<bytes>
+
+        Checked against four waveforms this app had uploaded and cached: same
+        point counts, and agreement to 1.53e-05, which is one code in 16 bits -
+        the round trip through the DAC's own resolution and nothing more.
+
+        Needs numpy. Returns a numpy array.
+        """
+        if self.dev is None:
+            raise InstrumentError("not connected; call connect() first")
+        if np is None:
+            raise InstrumentError("read_waveform needs numpy")
+        previous = self.dev.read_termination
+        try:
+            # The payload is binary and will contain 0x0A, so the line
+            # terminator has to come off or the read stops inside the samples.
+            self.dev.read_termination = None
+            self.dev.write(f"WVDT? USER,{name}")
+            raw = self.dev.read_raw()
+            marker = b"WAVEDATA,"
+            at = raw.find(marker)
+            if at < 0:
+                raise InstrumentError(
+                    f"no waveform data came back for {name!r}: {raw[:120]!r}")
+            fields = [f.strip() for f in
+                      raw[:at].decode("ascii", "replace").split(",")]
+            fields[0] = fields[0].partition(" ")[2]
+            head = {fields[i]: fields[i + 1]
+                    for i in range(0, len(fields) - 1, 2)}
+            body = raw[at + len(marker):]
+            want = int(str(head.get("LENGTH", "0")).rstrip("B") or 0)
+            while want and len(body) < want:
+                body += self.dev.read_raw()
+            if want:
+                body = body[:want]
+            if len(body) % 2:
+                body = body[:-1]        # a trailing terminator byte, not a sample
+            return np.frombuffer(body, dtype="<i2").astype(np.float64) / 32767.0
+        finally:
+            self.dev.read_termination = previous
+
+    # ------------------------------------------------------- front panel
+
+    def press(self, key: str) -> None:
+        """Press a front-panel key remotely.
+
+        The only way to reach anything the SCPI set does not cover, which on
+        this firmware includes deleting a stored waveform: WVDT DEL, STL DEL,
+        DEL_STORE_FILE, DELETE, MMEM and eighteen other spellings are all
+        accepted in silence and do nothing, so the front panel is the only
+        route and this is how it is reached.
+
+        `key` is a name from KEYS, or a bare index for a key not in the table.
+        VKEY is set-only - there is no query form, and asking for one just
+        times out, which is not the same as the command being absent.
+        """
+        value = KEYS.get(key, key)
+        self.write(f"VKEY VALUE,{value},STATE,1")
+
+    def store_recall(self) -> None:
+        """Open the Store/Recall page, which is where files are deleted."""
+        self.press("KB_STORE_RECALL")
+
     def sample_rate(self, channel: int, mode: str | None = None, value=None,
                     interpolation: str | None = None) -> dict:
         """DDS mode resamples the arb to hit an exact frequency; TARB (TrueArb)
@@ -717,9 +828,21 @@ class BK4063B:
             arb = parse_reply(groups["ARWV"])
             if arb.get("INDEX") is not None:
                 # Built-in waveforms only reload by index; NAME silently no-ops.
+                # A built-in is also the only case that reports an INDEX at all:
+                # a user waveform reads back as bare NAME,<name>.bin.
                 self.write(f"{prefix}:ARWV INDEX,{int(arb['INDEX'])}")
             elif arb.get("NAME"):
-                self.write(f"{prefix}:ARWV NAME,{arb['NAME']}")
+                # The generator appends .bin on readback and will not take it
+                # back. Sent with the suffix, ARWV NAME is accepted in silence
+                # and selects nothing, so the channel keeps whatever it was
+                # already on - measured by snapshotting a channel playing a
+                # user arb, sending *RST, and restoring: the waveform came back
+                # as the built-in StairUp the reset had left selected, with the
+                # rest of the channel restored correctly around it. The panel's
+                # own recall path has always stripped this; restore() did not.
+                name = str(arb["NAME"])
+                self.write(f"{prefix}:ARWV NAME,"
+                           f"{name[:-4] if name.endswith('.bin') else name}")
 
             srate = parse_reply(groups["SRATE"])
             self._set(ch, "SRATE", srate)
