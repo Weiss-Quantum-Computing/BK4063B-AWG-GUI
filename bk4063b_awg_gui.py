@@ -1690,7 +1690,12 @@ class App:
         # thread, which is why it is a plain flag and not a widget state.
         self.del_win = None
         self.del_stop = False
-        self.del_keys = {"Delete": STORE_RECALL_KEYS["Delete"],
+        # Cursor first, and before every delete rather than once at the top:
+        # the Store/Recall list opens on the "Local C:" drive row, and it goes
+        # back there after each file is removed. One click clockwise steps off
+        # it and onto the first real file. Measured at the panel.
+        self.del_keys = {"Cursor": "KB_KNOB_RIGHT",
+                         "Delete": STORE_RECALL_KEYS["Delete"],
                          "Accept": STORE_RECALL_KEYS["Delete"]}
 
         self.seq_win = None
@@ -4139,8 +4144,10 @@ class App:
             "The front panel deletes whichever file the cursor is on, and that "
             "cursor cannot be read back over USB - so this deletes from wherever "
             "the cursor sits and reports which name actually went, rather than "
-            "promising to delete a name you picked. Use the knob on the "
-            "generator to put the cursor where you want it.")
+            "promising to delete a name you picked.\n\n"
+            "The list also drops back to the 'Local C:' drive row after every "
+            "delete, so each file takes a cursor step, then Delete, then Accept. "
+            "That is why the order below is what it is.")
         ).pack(anchor="w", padx=10, pady=(10, 6))
 
         self.del_state = ttk.Label(win, justify="left", foreground="#060")
@@ -4158,19 +4165,35 @@ class App:
             "softkey")).pack(side="left")
 
         softkeys = [k for k in KEYS if k.startswith("KB_FUNC")]
-        for role, hint in (("Delete", "the screen should ask 'Delete the file?'"),
-                           ("Accept", "the file should disappear from the list")):
+        # The cursor step is a knob click rather than a softkey, so it gets the
+        # knob and arrow keys to choose from - and "(none)", for a panel that
+        # is already sitting on a file and does not need stepping.
+        cursors = ["KB_KNOB_RIGHT", "KB_KNOB_LEFT", "KB_DOWN", "KB_UP", "(none)"]
+        for role, choices, hint in (
+                ("Cursor", cursors,
+                 "steps off the 'Local C:' row onto the first file"),
+                ("Delete", softkeys,
+                 "the screen should ask 'Delete the file?'"),
+                ("Accept", softkeys,
+                 "the file should disappear from the list")):
             r = ttk.Frame(step1)
             r.pack(fill="x", padx=8, pady=2)
-            ttk.Label(r, text=f"{role} softkey:", width=14).pack(side="left")
+            label = "Cursor step:" if role == "Cursor" else f"{role} softkey:"
+            ttk.Label(r, text=label, width=14).pack(side="left")
             var = tk.StringVar(value=self.del_keys[role])
             setattr(self, f"del_key_{role}", var)
-            ttk.Combobox(r, textvariable=var, values=softkeys, width=10,
+            ttk.Combobox(r, textvariable=var, values=choices, width=14,
                          state="readonly").pack(side="left")
             ttk.Button(r, text="Press it",
                        command=lambda ro=role: self._del_press_test(ro)).pack(
                            side="left", padx=6)
             ttk.Label(r, foreground="#666", text=hint).pack(side="left")
+        ttk.Label(step1, foreground="#666", justify="left", wraplength=600,
+                  text=("Each file takes all three, in that order, every time - "
+                        "the list drops back to the drive row after every "
+                        "delete, so the cursor step is not a one-off at the "
+                        "start.")
+                  ).pack(anchor="w", padx=8, pady=(2, 6))
 
         step2 = ttk.LabelFrame(win, text="2. Delete")
         step2.pack(fill="x", padx=10, pady=4)
@@ -4252,17 +4275,21 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _del_press_test(self, role):
-        """Press one of the two softkeys on its own, and remember the choice."""
+        """Press one of the three keys on its own, and remember the choice."""
         var = getattr(self, f"del_key_{role}", None)
         if var is not None:
             self.del_keys[role] = var.get()
-        self._del_press_raw(self.del_keys[role])
+        key = self.del_keys[role]
+        if key in (None, "", "(none)"):
+            self.log(f"{role} is set to (none) - nothing sent.")
+            return
+        self._del_press_raw(key)
 
     def _del_run(self):
         """Delete N files, checking the count after each one."""
         if self.busy or not self.awg.connected:
             return
-        for role in ("Delete", "Accept"):
+        for role in ("Cursor", "Delete", "Accept"):
             var = getattr(self, f"del_key_{role}", None)
             if var is not None:
                 self.del_keys[role] = var.get()
@@ -4305,6 +4332,13 @@ class App:
                     if self.del_stop:
                         self.log("  stopped.")
                         break
+                    # Cursor, then Delete, then Accept - every file. After a
+                    # delete the list goes back to the "Local C:" drive row,
+                    # so without the step the Delete softkey is aimed at a
+                    # directory rather than at a waveform.
+                    if keys.get("Cursor") not in (None, "", "(none)"):
+                        self.awg.press(keys["Cursor"])
+                        time.sleep(0.35)
                     self.awg.press(keys["Delete"])
                     time.sleep(0.5)
                     self.awg.press(keys["Accept"])

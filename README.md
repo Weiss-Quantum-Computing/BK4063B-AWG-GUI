@@ -787,10 +787,15 @@ cannot be read back, it deletes from wherever the cursor sits and reports which
 name actually went — rather than promising to delete one you picked. Put the
 cursor where you want it with the knob.
 
-Which softkey is Delete and which is Accept is confirmed once, with you
-watching the screen, and **every press after that is checked against the
-stored-waveform count**: a press that does not remove exactly one file stops
-the run rather than pressing keys blind into a menu it cannot see.
+Each file takes three presses, not two: the list opens on the `Local C:`
+drive row and drops back to it after every delete, so a **cursor step** (one
+knob click clockwise) comes before Delete and Accept every time, not once at
+the start. Measured at the panel.
+
+Which keys those are is confirmed once, with you watching the screen, and
+**every press after that is checked against the stored-waveform count**: a
+press that does not remove exactly one file stops the run rather than pressing
+keys blind into a menu it cannot see.
 
 Re-uploading a name still overwrites it, so reusing names keeps the list from
 growing in the first place.
