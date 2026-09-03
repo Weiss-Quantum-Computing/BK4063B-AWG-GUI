@@ -630,6 +630,23 @@ Everything on the channel panel reaches the trace:
 
 ![Parameters the preview now honours](figures/preview_modes.png)
 
+**Zoom and pan** come from matplotlib's own toolbar under the plot, the same
+one the ILC panel uses - drag a rectangle to zoom, pan, step back and forward
+through views, save the figure as a PNG.
+
+The preview redraws on every keystroke, so a zoom would otherwise last until
+the next character typed. It does not: a drag that ends in zoom or pan mode
+holds that view, and every redraw after it keeps the same window while the
+traces underneath change - which is the point, since it is how you watch one
+edge move as you type. **Home** gives auto-scaling back.
+
+A held view is worth knowing about, because it looks exactly like a broken
+one - raise the amplitude with a zoom on and the trace simply leaves the
+window. So the toolbar row says `zoomed - Home to auto-scale` whenever the
+picture is not scaling itself. Changing the panel layout (**separate time
+axes**, **separate Y axes**, or showing a channel that was hidden) drops the
+lock on its own, since the old limits describe axes that no longer exist.
+
 **With a mode running, the window follows the envelope rather than the carrier** -
 the modulating period for AM/FM/PM/PWM, the keying period for the shift keys, the
 sweep time, the burst period. Two carrier cycles of a 10 kHz tone under 100 Hz AM

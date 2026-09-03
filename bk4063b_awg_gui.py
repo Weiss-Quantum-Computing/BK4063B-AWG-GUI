@@ -40,7 +40,8 @@ try:
     import matplotlib
     matplotlib.use("TkAgg")
     matplotlib.rcParams["font.size"] = 8
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                                   NavigationToolbar2Tk)
     from matplotlib.figure import Figure
 except ImportError:                       # everything but the preview still works
     Figure = None
@@ -2946,6 +2947,31 @@ class App:
         self.canvas = FigureCanvasTkAgg(self.fig, master=f)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
 
+        # Matplotlib's own toolbar, as in the ILC panel: zoom to a rectangle,
+        # pan, back/forward through views, and save the figure.
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", padx=4)
+        self.nav = NavigationToolbar2Tk(self.canvas, bar, pack_toolbar=False)
+        self.nav.update()
+        self.nav.pack(side="left")
+        # The preview redraws on every keystroke, so without this a zoom would
+        # survive until the next character typed. Any drag that ends while the
+        # toolbar is in zoom or pan mode locks the view, and it is held until
+        # Home.
+        self.view_locked = False
+        self.canvas.mpl_connect("button_release_event", self._preview_dragged)
+        home = self._preview_home(self.nav.home)
+        self.nav.home = home
+        # And the button, which is the part that matters. The toolbar wires
+        # each button to the bound method it found at construction, so
+        # replacing the attribute alone leaves the button calling the original
+        # - measured: the lock survived a Home click until this line existed.
+        button = getattr(self.nav, "_buttons", {}).get("Home")
+        if button is not None:
+            button.configure(command=home)
+        self.view_note = ttk.Label(bar, text="", foreground="#06c")
+        self.view_note.pack(side="left", padx=(10, 0))
+
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Label(r, text="Show:").pack(side="left")
@@ -2973,6 +2999,70 @@ class App:
         self.split_t = tk.BooleanVar(value=False)
         ttk.Checkbutton(r, text="separate time axes", variable=self.split_t,
                         command=self.draw_preview).pack(side="right", padx=(0, 10))
+
+    def _preview_dragged(self, event):
+        """A zoom or pan has just finished, so hold that view.
+
+        Only while the toolbar is in one of those modes: a plain click on the
+        canvas is not a request to freeze anything.
+        """
+        if str(getattr(self.nav, "mode", "")):
+            self.view_locked = True
+            self.refresh_view_note()
+
+    def _preview_home(self, original):
+        """Home goes back to the automatic view, not just to the nav stack's.
+
+        The stack only holds views the toolbar itself produced. Every redraw
+        here is programmatic, so after Home the axes have to be rebuilt from
+        the panel rather than restored from a stack that never saw them.
+        """
+        def home(*args, **kwargs):
+            self.view_locked = False
+            try:
+                original(*args, **kwargs)
+            except Exception:
+                pass            # an empty nav stack is not a failure
+            self.draw_preview()
+        return home
+
+    def refresh_view_note(self):
+        """Say when the picture is not auto-scaling, because a frozen view is
+        indistinguishable from a broken one: change the amplitude with a zoom
+        held and the trace simply leaves the window."""
+        note = getattr(self, "view_note", None)
+        if note is not None:
+            note.configure(text="zoomed - Home to auto-scale"
+                                if self.view_locked else "")
+
+    def remember_view(self):
+        """The limits the user is looking at, or None when auto-scaling.
+
+        Taken before the axes are cleared, and keyed on the layout: with a
+        different number of panels the old limits describe axes that no longer
+        exist.
+        """
+        if not self.view_locked or not self.axes:
+            return None
+        return ([(a.get_xlim(), a.get_ylim()) for a in self.axes],
+                self.ax2.get_ylim() if self.ax2 is not None else None,
+                self.axes_key)
+
+    def restore_view(self, saved):
+        if not saved:
+            return
+        limits, twin, key = saved
+        if key != self.axes_key or len(limits) != len(self.axes):
+            # The layout changed under it - panels added, or a y axis twinned.
+            # Auto-scale is the only honest answer, so let it.
+            self.view_locked = False
+            self.refresh_view_note()
+            return
+        for axis, (xlim, ylim) in zip(self.axes, limits):
+            axis.set_xlim(xlim)
+            axis.set_ylim(ylim)
+        if twin is not None and self.ax2 is not None:
+            self.ax2.set_ylim(twin)
 
     # -- helpers -----------------------------------------------------------
 
@@ -5028,6 +5118,7 @@ class App:
         """
         if self.canvas is None:
             return
+        saved = self.remember_view()
         wanted = [ch for ch in CHANNELS if self.show_ch[ch].get()]
         target = int(self.arb_ch.get())
         pending = None
@@ -5136,6 +5227,8 @@ class App:
         self.show_alias_note(spans, target, pending, pending_span)
         self.axes[0].set_title(" | ".join(notes) if notes else "",
                                fontsize=8, color="#666")
+        self.restore_view(saved)
+        self.refresh_view_note()
         self.canvas.draw_idle()
 
     # -- config ------------------------------------------------------------
