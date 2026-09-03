@@ -4260,6 +4260,16 @@ class App:
             side="left", padx=(4, 10))
         r1b = ttk.Frame(step2)
         r1b.pack(fill="x", padx=8, pady=(0, 2))
+        # On by default. A run started with the panel anywhere else sends its
+        # Delete into whatever menu happens to be showing, which removes
+        # nothing and stops the run at the first file - and opening the page
+        # also puts the cursor back on the drive row, which is exactly the
+        # state the loop below expects. Untickable in case pressing the key
+        # while already on the page turns out to leave it.
+        self.del_open = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            r1b, variable=self.del_open,
+            text="open Store/Recall first").pack(side="left", padx=(0, 14))
         self.del_ack = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             r1b, variable=self.del_ack,
@@ -4427,10 +4437,20 @@ class App:
         self.del_stop = False
         self.set_busy(True)
         keys = dict(self.del_keys)
+        open_first = bool(self.del_open.get())
 
         def work():
             done, names = 0, []
             try:
+                if open_first:
+                    # Establish the page rather than assuming it. A run begun
+                    # with the panel showing anything else put its Delete into
+                    # that menu instead, removed nothing, and stopped at the
+                    # first file - which is what happened at the bench, with
+                    # Store/Recall only pressed afterwards.
+                    self.log("  opening Store/Recall on the generator")
+                    self.awg.press("KB_STORE_RECALL")
+                    time.sleep(1.2)
                 before = self.device_names()
                 self.log(f"Deleting up to {want} file(s) from the generator "
                          f"({len(before)} stored), waiting out a {lockout:g} s "
@@ -4468,18 +4488,22 @@ class App:
                         self.log(
                             f"  STOPPING at file {step + 1}: expected one file "
                             f"to go and {why} ({len(before)} -> {len(after)}). "
-                            f"The keys are probably not the ones this is "
-                            f"sending, the panel has moved off the Store/Recall "
-                            f"page, or the lockout is longer than "
+                            f"Look at the generator: it should be showing the "
+                            f"Store/Recall file list. If it is not, that is the "
+                            f"reason. Otherwise the keys are not the ones this "
+                            f"is sending, or the lockout is longer than "
                             f"{lockout:g} s.")
                         self.root.after(0, lambda: messagebox.showwarning(
                             "Delete stopped",
                             "A key press did not remove exactly one file, so the "
                             "run stopped rather than pressing keys blind.\n\n"
-                            "Check the generator's screen: it should be on "
-                            "Store/Recall with the file list showing. Then "
-                            "confirm the three keys again in step 1, and if the "
-                            "panel was still busy, raise the lockout time."))
+                            "Look at the generator first: it should be showing "
+                            "the Store/Recall file list. If it is showing "
+                            "anything else, that is the reason - leave 'open "
+                            "Store/Recall first' ticked.\n\n"
+                            "If it was on the right page, confirm the three keys "
+                            "again in step 1, and if the panel was still busy, "
+                            "raise the lockout time."))
                         break
                     done += 1
                     names.append(gone[0])

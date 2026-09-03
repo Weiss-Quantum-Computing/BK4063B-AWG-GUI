@@ -858,6 +858,12 @@ than of this app and a fuller directory may not behave the same. If a run stops
 that way, raise it. It does mean a long run is slow - budget roughly five
 seconds a file, so about an hour for six hundred.
 
+The run presses **Store/Recall** itself before the first file, rather than
+assuming the panel was left there - a run started with the generator showing
+anything else sends its Delete into that menu, removes nothing, and stops at
+the first file. Opening the page also puts the cursor back on the drive row,
+which is the state the loop expects.
+
 Which keys those are is confirmed once, with you watching the screen, and
 **every press after that is checked against the stored-waveform count**: a
 press that does not remove exactly one file stops the run rather than pressing
