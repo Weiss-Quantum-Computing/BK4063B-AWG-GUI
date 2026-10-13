@@ -12,8 +12,8 @@ Outputs are never switched by Apply, by Recall, or by closing the window - only
 the ON/OFF buttons do that, and by default they ask first. A channel that is
 already driving something stays driving it.
 
-Requires: bk4063b.py beside this file, NI-VISA (or any VISA), and
-          `pip install pyvisa numpy matplotlib` (matplotlib only draws the
+Requires: bk4063b.py and labplot.py beside this file, NI-VISA (or any VISA),
+          and `pip install pyvisa numpy matplotlib` (matplotlib only draws the
           waveform preview - everything else works without it)
 Run with:  pythonw bk4063b_awg_gui.py    (pythonw = no console window)
 """
@@ -23,6 +23,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -39,12 +40,22 @@ from bk4063b import (BK4063B, CHANNELS, KEYS, MODE_VERBS, STORE_RECALL_KEYS,
 try:
     import matplotlib
     matplotlib.use("TkAgg")
-    matplotlib.rcParams["font.size"] = 8
-    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
-                                                   NavigationToolbar2Tk)
-    from matplotlib.figure import Figure
 except ImportError:                       # everything but the preview still works
-    Figure = None
+    matplotlib = None
+
+# The preview is drawn on the lab's shared plot panel, labplot.py, vendored
+# beside this file from Weiss-Quantum-Computing/lab-plot. Other programs load
+# this GUI by file path (spec_from_file_location), which does not put this
+# folder on sys.path, so it is put there here before the import. labplot
+# itself copes with matplotlib being absent; a missing labplot.py only costs
+# the preview, the same as a missing matplotlib does.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+try:
+    import labplot
+except ImportError:
+    labplot = None
 
 # Remembered between sessions: folder, prefix, arb settings, safety toggles.
 # Kept out of the program folder so a git pull cannot clobber it.
@@ -64,12 +75,21 @@ CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
 WAVE_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Waveforms")
 
 # One colour per channel, used for the trace, the checkbox and the split
-# y axis, so a glance at any of them identifies the others.
-CH_COLOUR = {1: "#1f77b4", 2: "#d62728"}      # blue, red
+# y axis, so a glance at any of them identifies the others. The lab's shared
+# set (CH1 blue, CH2 red, the same in every panel); the literal values are
+# the fallback for a folder without labplot.py, where only the checkboxes
+# still need them. CH_COLOUR is the name the rest of this file uses.
+CH_COLOURS = (labplot.CH_COLOURS if labplot is not None
+              else {1: "#1f77b4", 2: "#d62728", 3: "#2e7d32", 4: "#9467bd"})
+CH_COLOUR = CH_COLOURS
 
 
 def _lighten(colour, amount):
-    """A paler version of a hex colour, mixed towards white."""
+    """A paler version of a hex colour, mixed towards white.
+
+    For the output buttons, which exist with or without matplotlib; the
+    preview's pending shade comes from labplot.lighten instead.
+    """
     red, green, blue = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
     mix = [int(round(c + (255 - c) * amount)) for c in (red, green, blue)]
     return "#%02x%02x%02x" % tuple(mix)
@@ -95,7 +115,9 @@ OUT_LOOK = {
 # The pending trace is the channel it is aimed at, but not yet: a paler shade
 # of that channel's colour says both at once, where the same colour dashed left
 # it looking like the channel's own trace drawn twice.
-PENDING_COLOUR = {ch: _lighten(colour, 0.42) for ch, colour in CH_COLOUR.items()}
+PENDING_COLOUR = {ch: (labplot.lighten(colour) if labplot is not None
+                       else _lighten(colour, 0.42))
+                  for ch, colour in CH_COLOUR.items()}
 
 # A value the panel worked out rather than one that was set. Light enough to
 # read black text through, since it sits behind an entry box.
@@ -1641,6 +1663,8 @@ def describe(snap):
 class App:
     def __init__(self, root):
         self.root = root
+        if labplot is not None:
+            labplot.apply_style()         # the lab's one plot style, once
         self.awg = BK4063B(connect=False)
         self.msgs = queue.Queue()
         self.busy = False
@@ -1817,7 +1841,7 @@ class App:
         self.saved_cfg = None
         self.load_config()
         self.refresh_marks()
-        self.draw_preview()
+        self.redraw_preview()
 
     # -- panel construction ------------------------------------------------
 
@@ -2680,7 +2704,7 @@ class App:
                              state="readonly")
         chbox.pack(side="left", padx=4)
         # The pending trace takes its colour and its timebase from this channel.
-        chbox.bind("<<ComboboxSelected>>", lambda e: self.draw_preview())
+        chbox.bind("<<ComboboxSelected>>", lambda e: self.redraw_preview())
         self.norm = tk.BooleanVar(value=True)
         ttk.Checkbutton(r2, text="normalise to full scale", variable=self.norm,
                         command=self.on_norm).pack(side="left", padx=8)
@@ -2773,7 +2797,7 @@ class App:
             self.log(f"Local copies unchanged ({len(self.known_waves)} in "
                      f"{WAVE_CACHE}).")
         self.refresh_memory(self.device_waves)
-        self.draw_preview()
+        self.redraw_preview()
         if self.awg.connected:
             self.do_read()
 
@@ -2828,7 +2852,7 @@ class App:
         cache_forget(name)
         self.log(f"Forgot the local copy of '{name}' (still on the generator)")
         self.refresh_memory(self.device_waves)
-        self.draw_preview()
+        self.redraw_preview()
 
     def do_use_wave(self):
         """Load the selected waveform's local copy into the pending slot.
@@ -2935,59 +2959,51 @@ class App:
     def build_preview(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Preview (what Apply would produce)")
         f.pack(fill="x", **pad)
-        if Figure is None:
-            ttk.Label(f, text="matplotlib not installed - no preview",
-                      foreground="#666").pack(padx=8, pady=8)
-            self.canvas = None
-            return
-        self.fig = Figure(figsize=(5.6, 3.0), dpi=100)
         # Built on the first draw and rebuilt only when the layout changes -
         # how many panels there are, and whether one of them is twinned.
         self.axes, self.ax, self.ax2, self.axes_key = [], None, None, None
-        self.canvas = FigureCanvasTkAgg(self.fig, master=f)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
+        self.layout_changed = False
+        self.preview = self.fig = self.canvas = None
+        if labplot is None:
+            ttk.Label(f, text="labplot.py missing beside bk4063b_awg_gui.py",
+                      foreground="#666").pack(padx=8, pady=8)
+            return
 
-        # Matplotlib's own toolbar, as in the ILC panel: zoom to a rectangle,
-        # pan, back/forward through views, and save the figure.
-        bar = ttk.Frame(f)
-        bar.pack(fill="x", padx=4)
-        self.nav = NavigationToolbar2Tk(self.canvas, bar, pack_toolbar=False)
-        self.nav.update()
-        self.nav.pack(side="left")
-        # The preview redraws on every keystroke, so without this a zoom would
-        # survive until the next character typed. Any drag that ends while the
-        # toolbar is in zoom or pan mode locks the view, and it is held until
-        # Home.
-        self.view_locked = False
-        self.canvas.mpl_connect("button_release_event", self._preview_dragged)
-        home = self._preview_home(self.nav.home)
-        self.nav.home = home
-        # And the button, which is the part that matters. The toolbar wires
-        # each button to the bound method it found at construction, so
-        # replacing the attribute alone leaves the button calling the original
-        # - measured: the lock survived a Home click until this line existed.
-        button = getattr(self.nav, "_buttons", {}).get("Home")
-        if button is not None:
-            button.configure(command=home)
-        self.view_note = ttk.Label(bar, text="", foreground="#06c")
-        self.view_note.pack(side="left", padx=(10, 0))
+        # The lab's shared panel: the stock toolbar (Home, Back, Forward,
+        # Pan, Zoom, Save), the view held across a redraw once zoomed or
+        # panned with the "zoomed - Home to auto-scale" note, wheel zoom,
+        # right-click copy of the cursor, and Save proposing a name in the
+        # output folder. Without matplotlib it is a label saying so.
+        #
+        # Not constrained_layout: preview_axes sets the margins itself,
+        # because it also grows the figure with the panel count.
+        self.preview = labplot.PlotPanel(
+            f, draw=self.draw_preview, figsize=(5.6, 3.0), dpi=100,
+            constrained=False, save_name=lambda: "awg_preview",
+            save_dir=lambda: self.outdir.get().strip(), on_status=self.log)
+        self.preview.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        if not labplot.HAVE_MPL:
+            return
+        self.fig = self.preview.fig
+        self.canvas = self.preview.canvas
 
-        r = ttk.Frame(f)
-        r.pack(fill="x", padx=6, pady=(0, 6))
-        ttk.Label(r, text="Show:").pack(side="left")
+        # The trace switches go in the panel's own row above the figure, so
+        # the layout matches the other GUIs: controls above, toolbar below.
+        r = self.preview.controls
+        ttk.Label(r, text="Show:").pack(side="left", padx=(2, 0))
         self.show_ch = {}
         for ch in CHANNELS:
             var = tk.BooleanVar(value=True)
             self.show_ch[ch] = var
             box = tk.Checkbutton(r, text=f"CH{ch}", variable=var,
-                                 command=self.draw_preview,
+                                 command=self.redraw_preview,
                                  foreground=CH_COLOUR[ch],
                                  activeforeground=CH_COLOUR[ch],
                                  selectcolor="white")
             box.pack(side="left", padx=(4, 0))
         self.show_pending = tk.BooleanVar(value=True)
         ttk.Checkbutton(r, text="pending", variable=self.show_pending,
-                        command=self.draw_preview).pack(side="left", padx=(8, 0))
+                        command=self.redraw_preview).pack(side="left", padx=(8, 0))
         # Sits with the trace switches because that is what it is about: a
         # caveat on the picture belongs beside the picture, where it can change
         # on every keystroke without a log filling up behind it.
@@ -2995,74 +3011,29 @@ class App:
         self.alias_note.pack(side="left", padx=(14, 4))
         self.split_y = tk.BooleanVar(value=False)
         ttk.Checkbutton(r, text="separate Y axes", variable=self.split_y,
-                        command=self.draw_preview).pack(side="right")
+                        command=self.redraw_preview).pack(side="right", padx=(0, 2))
         self.split_t = tk.BooleanVar(value=False)
         ttk.Checkbutton(r, text="separate time axes", variable=self.split_t,
-                        command=self.draw_preview).pack(side="right", padx=(0, 10))
+                        command=self.redraw_preview).pack(side="right", padx=(0, 10))
 
-    def _preview_dragged(self, event):
-        """A zoom or pan has just finished, so hold that view.
+    def redraw_preview(self):
+        """Redraw the preview through the panel, which holds a zoomed view
+        across the redraw and releases it when the layout changes.
 
-        Only while the toolbar is in one of those modes: a plain click on the
-        canvas is not a request to freeze anything.
+        The panel tells a layout change by the number of axes, which misses
+        one case this preview has: one twinned panel and two stacked panels
+        are both two axes. preview_axes flags a rebuild, and a held view
+        across one is given up here by going Home, which draws once more
+        auto-scaled rather than restoring limits that describe axes that no
+        longer exist.
         """
-        if str(getattr(self.nav, "mode", "")):
-            self.view_locked = True
-            self.refresh_view_note()
-
-    def _preview_home(self, original):
-        """Home goes back to the automatic view, not just to the nav stack's.
-
-        The stack only holds views the toolbar itself produced. Every redraw
-        here is programmatic, so after Home the axes have to be rebuilt from
-        the panel rather than restored from a stack that never saw them.
-        """
-        def home(*args, **kwargs):
-            self.view_locked = False
-            try:
-                original(*args, **kwargs)
-            except Exception:
-                pass            # an empty nav stack is not a failure
-            self.draw_preview()
-        return home
-
-    def refresh_view_note(self):
-        """Say when the picture is not auto-scaling, because a frozen view is
-        indistinguishable from a broken one: change the amplitude with a zoom
-        held and the trace simply leaves the window."""
-        note = getattr(self, "view_note", None)
-        if note is not None:
-            note.configure(text="zoomed - Home to auto-scale"
-                                if self.view_locked else "")
-
-    def remember_view(self):
-        """The limits the user is looking at, or None when auto-scaling.
-
-        Taken before the axes are cleared, and keyed on the layout: with a
-        different number of panels the old limits describe axes that no longer
-        exist.
-        """
-        if not self.view_locked or not self.axes:
-            return None
-        return ([(a.get_xlim(), a.get_ylim()) for a in self.axes],
-                self.ax2.get_ylim() if self.ax2 is not None else None,
-                self.axes_key)
-
-    def restore_view(self, saved):
-        if not saved:
+        if self.preview is None:
             return
-        limits, twin, key = saved
-        if key != self.axes_key or len(limits) != len(self.axes):
-            # The layout changed under it - panels added, or a y axis twinned.
-            # Auto-scale is the only honest answer, so let it.
-            self.view_locked = False
-            self.refresh_view_note()
-            return
-        for axis, (xlim, ylim) in zip(self.axes, limits):
-            axis.set_xlim(xlim)
-            axis.set_ylim(ylim)
-        if twin is not None and self.ax2 is not None:
-            self.ax2.set_ylim(twin)
+        self.layout_changed = False
+        self.preview.draw()
+        if self.layout_changed and self.preview.view_locked:
+            self.layout_changed = False
+            self.preview.home()
 
     # -- helpers -----------------------------------------------------------
 
@@ -3107,7 +3078,7 @@ class App:
             # worked out again for anything on the channel.
             self.show_burst_idle(int(key[1]))
         self.refresh_marks()
-        self.draw_preview()
+        self.redraw_preview()
 
     def edited(self, key):
         """True if the panel value differs from what the generator last said."""
@@ -3757,7 +3728,7 @@ class App:
         self.read_stamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.set_busy(False)
         self.refresh_marks()
-        self.draw_preview()
+        self.redraw_preview()
 
     def do_discard(self):
         """Put every cell back to what the generator last reported.
@@ -3793,7 +3764,7 @@ class App:
         finally:
             self.loading = False
         self.refresh_marks()
-        self.draw_preview()
+        self.redraw_preview()
         self.log(f"Discarded {len(pending)} unapplied change(s).")
 
     def do_read(self):
@@ -4051,12 +4022,12 @@ class App:
         self.log(f"  using column {index + 1}: {data.size} pts, "
                  f"{data.min():g} to {data.max():g}")
         self.set_busy(self.busy)
-        self.draw_preview()
+        self.redraw_preview()
 
     def on_norm(self):
         """The normalise switch changes what will be sent, so say so at once."""
         self.show_arb_info()
-        self.draw_preview()
+        self.redraw_preview()
 
     def show_arb_info(self):
         """The line beside Load file..., including a full-scale warning.
@@ -4099,7 +4070,7 @@ class App:
         self.show_arb_info()
         self.log(f"Pending waveform cleared ({was}). Nothing was sent.")
         self.set_busy(self.busy)
-        self.draw_preview()
+        self.redraw_preview()
 
     def do_upload(self):
         if self.busy or not self.awg.connected or self.arb_samples is None:
@@ -5068,6 +5039,8 @@ class App:
         """
         key = (panels, twin)
         if key != self.axes_key:
+            # Told to redraw_preview, which gives up a held view over this.
+            self.layout_changed = self.axes_key is not None
             self.fig.clf()
             self.axes = list(self.fig.subplots(panels, 1, squeeze=False)[:, 0])
             self.ax = self.axes[0]
@@ -5104,7 +5077,7 @@ class App:
             self.ax2.yaxis.set_ticks_position("right")
         return self.axes
 
-    def draw_preview(self):
+    def draw_preview(self, fig=None):
         """Every enabled trace, on one shared time axis or on one each.
 
         Shared is the default and the honest one: the channels are simultaneous
@@ -5115,10 +5088,16 @@ class App:
 
         The pending waveform is drawn as it would come out of the channel it is
         aimed at, dashed and in a paler shade of that channel's colour.
+
+        Called by the panel with its figure (always self.fig); the panel
+        holds a zoomed view across the call and paints afterwards, so this
+        neither remembers limits nor draws the canvas. Go through
+        redraw_preview, not here.
         """
         if self.canvas is None:
             return
-        saved = self.remember_view()
+        if fig is None:
+            fig = self.fig
         wanted = [ch for ch in CHANNELS if self.show_ch[ch].get()]
         target = int(self.arb_ch.get())
         pending = None
@@ -5132,14 +5111,12 @@ class App:
                 pending = None
 
         if not wanted and pending is None:
-            axis = self.preview_axes(1, False)[0]
-            axis.text(0.5, 0.5,
-                      "nothing selected" + chr(10) + "tick CH1, CH2 or pending",
-                      ha="center", va="center", transform=axis.transAxes,
-                      color="#666")
-            axis.set_xticks([]); axis.set_yticks([])
+            # placeholder clears the figure, so the axes have to be made
+            # again on the next draw whatever layout it asks for.
+            labplot.placeholder(fig, "nothing selected" + chr(10)
+                                + "tick CH1, CH2 or pending")
+            self.axes, self.ax, self.ax2, self.axes_key = [], None, None, None
             self.show_alias_note({}, target, None, 0.0)
-            self.canvas.draw_idle()
             return
 
         # One panel per channel when times are split, otherwise all in one. The
@@ -5207,8 +5184,7 @@ class App:
                         label=f"pending -> CH{target} ({pending.size} pts, "
                               f"{'held' if hold else 'interpolated'})")
 
-            axis.set_xlabel("time (ms)")
-            axis.grid(alpha=0.3)
+            labplot.finish(axis, "time (ms)")
             if twin:
                 axis.set_ylabel("CH1 volts", color=CH_COLOUR[1])
                 self.ax2.set_ylabel("CH2 volts", color=CH_COLOUR[2])
@@ -5221,15 +5197,18 @@ class App:
                 axis.set_ylabel("volts", color="black")
                 axis.tick_params(axis="y", colors="black")
             if handles:
-                axis.legend(handles, [h.get_label() for h in handles],
-                            fontsize=7, loc="upper right", framealpha=0.85)
+                # The handles are passed because a twinned CH2 line lives on
+                # the other axes. Upper right rather than "best": this
+                # redraws on every keystroke, and a legend that hunts for
+                # room jumps about while the trace changes under it.
+                labplot.legend(axis, n=len(handles), loc="upper right",
+                               handles=handles,
+                               labels=[h.get_label() for h in handles])
 
         self.show_alias_note(spans, target, pending, pending_span)
+        # The title names what could not be drawn and why; nothing else.
         self.axes[0].set_title(" | ".join(notes) if notes else "",
                                fontsize=8, color="#666")
-        self.restore_view(saved)
-        self.refresh_view_note()
-        self.canvas.draw_idle()
 
     # -- config ------------------------------------------------------------
 

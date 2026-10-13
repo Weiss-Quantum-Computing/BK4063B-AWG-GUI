@@ -22,8 +22,13 @@ recall later or file alongside the data it produced.
 - `pip install pyvisa numpy matplotlib`
 - `bk4063b.py` next to `bk4063b_awg_gui.py` - the panel imports the instrument
   layer from it rather than carrying a second copy
+- `labplot.py` next to it as well - the lab's shared plot panel, vendored from
+  [lab-plot](../lab-plot); `python tools/vendor.py --check` there says whether
+  this copy is current
 
-Matplotlib is optional; without it you lose the waveform preview and nothing else.
+Matplotlib is optional; without it you lose the waveform preview and nothing
+else. The same goes for `labplot.py`: without it the preview is a note saying
+it is missing.
 
 ## Usage
 
@@ -630,22 +635,23 @@ Everything on the channel panel reaches the trace:
 
 ![Parameters the preview now honours](figures/preview_modes.png)
 
-**Zoom and pan** come from matplotlib's own toolbar under the plot, the same
-one the ILC panel uses - drag a rectangle to zoom, pan, step back and forward
-through views, save the figure as a PNG.
+The preview uses the lab's shared plot panel (labplot.py, vendored from
+Weiss-Quantum-Computing/lab-plot). Toolbar: Home, Back, Forward, Pan, Zoom,
+Save. Once you zoom or pan (toolbar or mouse wheel) the view is held across
+redraws and a blue note says 'zoomed - Home to auto-scale'; Home releases it.
+The mouse wheel zooms about the cursor (Shift keeps the x range, Ctrl keeps
+the y range) and each step goes on the Back stack. Right-click copies the
+cursor position as x<TAB>y to the clipboard. Save proposes a name and the
+output folder and writes PNG at 150 dpi.
 
-The preview redraws on every keystroke, so a zoom would otherwise last until
-the next character typed. It does not: a drag that ends in zoom or pan mode
-holds that view, and every redraw after it keeps the same window while the
-traces underneath change - which is the point, since it is how you watch one
-edge move as you type. **Home** gives auto-scaling back.
-
-A held view is worth knowing about, because it looks exactly like a broken
-one - raise the amplitude with a zoom on and the trace simply leaves the
-window. So the toolbar row says `zoomed - Home to auto-scale` whenever the
-picture is not scaling itself. Changing the panel layout (**separate time
-axes**, **separate Y axes**, or showing a channel that was hidden) drops the
-lock on its own, since the old limits describe axes that no longer exist.
+The hold is what makes the toolbar usable here: the preview redraws on every
+keystroke, and a held view is how you watch one edge move as you type. It
+looks exactly like a broken view - raise the amplitude with a zoom on and the
+trace simply leaves the window - which is what the note is for. Changing the
+panel layout (**separate time axes**, **separate Y axes**, or showing a
+channel that was hidden) drops the hold on its own, since the old limits
+describe axes that no longer exist. The trace switches sit in the panel's
+row above the figure, the toolbar below it.
 
 **With a mode running, the window follows the envelope rather than the carrier** -
 the modulating period for AM/FM/PM/PWM, the keying period for the shift keys, the
